@@ -143,6 +143,26 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         use_static_windows_guest_red_zone_protection ? static_protection_exception : true;
     if (report_unhandled) {
         LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
+        if (code == EXCEPTION_ACCESS_VIOLATION && pExp->ExceptionRecord->NumberParameters >= 2) {
+            // Report what was accessed and the register state, so guest crashes can be traced
+            // back to the faulting pointer instead of only the instruction address.
+            const ULONG_PTR kind = pExp->ExceptionRecord->ExceptionInformation[0];
+            const char* access_kind = kind == 0 ? "read" : kind == 1 ? "write" : "execute";
+            LOG_CRITICAL(Debug, "Faulting {} at data address {:#x}", access_kind,
+                         pExp->ExceptionRecord->ExceptionInformation[1]);
+            if (const CONTEXT* ctx = pExp->ContextRecord) {
+                LOG_CRITICAL(Debug,
+                             "rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} "
+                             "rbp={:#x} rsp={:#x}",
+                             ctx->Rax, ctx->Rbx, ctx->Rcx, ctx->Rdx, ctx->Rsi, ctx->Rdi, ctx->Rbp,
+                             ctx->Rsp);
+                LOG_CRITICAL(Debug,
+                             "r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} "
+                             "r14={:#x} r15={:#x} rip={:#x}",
+                             ctx->R8, ctx->R9, ctx->R10, ctx->R11, ctx->R12, ctx->R13, ctx->R14,
+                             ctx->R15, ctx->Rip);
+            }
+        }
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     }
 
