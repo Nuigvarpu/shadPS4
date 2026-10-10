@@ -3,8 +3,10 @@
 
 #pragma once
 
+#include <algorithm>
 #include <condition_variable>
 #include <coroutine>
+#include <cstring>
 #include <exception>
 #include <mutex>
 #include <semaphore>
@@ -72,9 +74,15 @@ public:
     void SubmitAsc(u32 gnm_vqid, std::span<const u32> acb);
 
     void SubmitDone() noexcept {
+        {
+            // Taken before (not inside) submit_mutex to keep the m_access -> submit_mutex
+            // lock order used by the GPU thread.
+            GpuQueue& gfx_queue = mapped_queues[GfxQueueId];
+            std::scoped_lock queue_lk(gfx_queue.m_access);
+            gfx_queue.ccb_copy.Reset();
+            gfx_queue.dcb_copy.Reset();
+        }
         std::scoped_lock lk{submit_mutex};
-        mapped_queues[GfxQueueId].ccb_buffer_offset = 0;
-        mapped_queues[GfxQueueId].dcb_buffer_offset = 0;
         submit_done = true;
         submit_cv.notify_one();
     }
@@ -121,9 +129,8 @@ public:
     void ReserveCopyBufferSpace() {
         GpuQueue& gfx_queue = mapped_queues[GfxQueueId];
         std::scoped_lock lk(gfx_queue.m_access);
-        constexpr size_t GfxReservedSize = 2_MB >> 2;
-        gfx_queue.ccb_buffer.reserve(GfxReservedSize);
-        gfx_queue.dcb_buffer.reserve(GfxReservedSize);
+        gfx_queue.ccb_copy.Reserve();
+        gfx_queue.dcb_copy.Reserve();
     }
 
     inline ComputeProgram& GetCsRegs() {
@@ -194,12 +201,55 @@ private:
     void ProcessCommands();
     void Process(std::stop_token stoken);
 
+    /// Stable storage for copies of guest command buffers. Memory is handed out from a list of
+    /// fixed-size blocks so that spans returned earlier are never invalidated when more space is
+    /// needed; a new block is allocated instead of reallocating (and moving) existing storage.
+    class CmdCopyArena {
+    public:
+        static constexpr size_t BlockSizeDw = 2_MB >> 2;
+
+        void Reserve() {
+            if (blocks.empty()) {
+                blocks.emplace_back(BlockSizeDw);
+            }
+        }
+
+        void Reset() {
+            block_index = 0;
+            block_offset = 0;
+        }
+
+        std::span<const u32> Copy(std::span<const u32> data) {
+            if (data.empty()) {
+                return data;
+            }
+            Reserve();
+            if (block_offset + data.size() > blocks[block_index].size()) {
+                // Move on to the next block, allocating one large enough if needed.
+                ++block_index;
+                block_offset = 0;
+                if (block_index == blocks.size()) {
+                    blocks.emplace_back(std::max(BlockSizeDw, data.size()));
+                } else if (blocks[block_index].size() < data.size()) {
+                    blocks[block_index].assign(data.size(), 0);
+                }
+            }
+            u32* const dst = blocks[block_index].data() + block_offset;
+            std::memcpy(dst, data.data(), data.size_bytes());
+            block_offset += data.size();
+            return std::span<const u32>{dst, data.size()};
+        }
+
+    private:
+        std::vector<std::vector<u32>> blocks;
+        size_t block_index{};
+        size_t block_offset{};
+    };
+
     struct GpuQueue {
         std::mutex m_access{};
-        std::atomic<u32> dcb_buffer_offset;
-        std::atomic<u32> ccb_buffer_offset;
-        std::vector<u32> dcb_buffer;
-        std::vector<u32> ccb_buffer;
+        CmdCopyArena dcb_copy;
+        CmdCopyArena ccb_copy;
         std::queue<Task::Handle> submits{};
         ComputeProgram cs_state{};
     };
