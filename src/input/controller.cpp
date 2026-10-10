@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <mutex>
+#include <numbers>
 #include <unordered_set>
 #include <utility>
 
@@ -122,6 +123,11 @@ void GameController::PollState() {
     PushStateLocked();
 }
 
+void GameController::SetShaking(bool shaking) {
+    std::lock_guard lock{m_state_mutex};
+    m_shaking = shaking;
+}
+
 void GameController::ResetOrientation() {
     std::lock_guard lock{m_state_mutex};
     m_state.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -206,8 +212,24 @@ void GameController::PushStateLocked(u64 timestamp) {
         timestamp = Libraries::Kernel::sceKernelGetProcessTime();
     }
     m_state.UpdateAxisSmoothing(timestamp);
-    m_state.OnGyro(gyro_buf);
-    m_state.OnAccel(accel_buf);
+    if (m_shaking) {
+        // Simulated shake: a ~7 Hz up/down oscillation on top of the current motion data. The
+        // gyro component is a zero-mean wobble so the integrated orientation does not drift.
+        constexpr float ShakeHz = 7.0f;
+        constexpr float AccelAmplitude = 25.0f; // m/s^2, well above gravity
+        constexpr float GyroAmplitude = 6.0f;   // rad/s
+        const float phase = 2.0f * std::numbers::pi_v<float> * ShakeHz *
+                            static_cast<float>(timestamp % 1'000'000) / 1'000'000.f;
+        const float accel[3] = {accel_buf[0], accel_buf[1] + AccelAmplitude * std::sin(phase),
+                                accel_buf[2]};
+        const float gyro[3] = {gyro_buf[0] + GyroAmplitude * std::cos(phase), gyro_buf[1],
+                               gyro_buf[2]};
+        m_state.OnGyro(gyro);
+        m_state.OnAccel(accel);
+    } else {
+        m_state.OnGyro(gyro_buf);
+        m_state.OnAccel(accel_buf);
+    }
     UpdateOrientationLocked(timestamp);
     m_state.time = timestamp;
     m_state.touch_time_since_held_down =
