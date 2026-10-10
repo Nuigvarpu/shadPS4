@@ -124,6 +124,10 @@ analog_deadzone = leftjoystick, 5, 127
 analog_deadzone = rightjoystick, 5, 127
 
 override_controller_color = false, 0, 0, 255
+
+# Accessibility: hold to simulate shaking the controller (motion sensors),
+# for games that require it (e.g. shaking a spray can). Works without a gyro-capable pad.
+motion_shake = g
 )";
 }
 std::filesystem::path GetInputConfigFile(const std::string& game_id) {
@@ -822,6 +826,9 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
             break;
         case MOUSE_GYRO_ROLL_MODE:
             SetMouseGyroRollMode(new_button_state);
+            break;
+        case MOTION_SHAKE:
+            controller->SetShaking(new_button_state);
             break;
         default: // is a normal key (hopefully)
             controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
