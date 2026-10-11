@@ -18,6 +18,8 @@ extern std::atomic<u64> g_gpu_wait_count;
 extern std::atomic<u64> g_gpu_wait_cp_ns;
 extern std::atomic<u64> g_submit_ns;
 extern std::atomic<u64> g_submit_count;
+extern std::atomic<u64> g_finish_wait_ns;
+extern std::atomic<u64> g_finish_wait_count;
 extern thread_local bool g_is_command_processor_thread;
 } // namespace AmdGpu
 
@@ -140,7 +142,10 @@ void Scheduler::Finish() {
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
     SubmitExecution(info);
+    const auto start = std::chrono::steady_clock::now();
     Wait(presubmit_tick);
+    AmdGpu::g_finish_wait_ns.fetch_add(ElapsedNs(start), std::memory_order_relaxed);
+    AmdGpu::g_finish_wait_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 void Scheduler::Wait(u64 tick) {
