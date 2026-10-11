@@ -284,16 +284,49 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             std::max<VAddr>(Common::AlignDown(device_addr, window_size), arena->cpu_addr);
         const VAddr window_end = std::min<VAddr>(
             std::max<VAddr>(window_start + window_size, device_addr + size), arena_end);
-        DownloadMemory(arena, window_start, window_end - window_start);
-        if (is_write) {
-            memory_tracker->MarkRegionAsCpuModified(device_addr, size);
-        }
-        downloaded = readback_stats.downloads.load(std::memory_order_relaxed) != downloads_before;
-
         RememberHotWindow(window_start, window_end, flush_start);
-        if (ReadbackPrefetchEnabled()) {
-            // The GPU is idle now, so the other hot windows can be downloaded cheaply before
-            // the guest faults on them.
+        if (!ReadbackPrefetchEnabled()) {
+            DownloadMemory(arena, window_start, window_end - window_start);
+        } else {
+            // Download the faulting window together with the other windows the guest keeps
+            // reading back, using a single GPU synchronization for all of them.
+            struct PendingWindow {
+                const Buffer* arena;
+                VAddr start;
+                u64 size;
+                size_t first_copy;
+                size_t num_copies;
+            };
+            boost::container::small_vector<PendingWindow, 17> pending;
+            boost::container::small_vector<vk::BufferCopy, 64> copies;
+            u64 total_size_bytes = 0;
+            const auto collect = [&](const Buffer* window_arena, VAddr start, u64 window_bytes) {
+                const size_t first_copy = copies.size();
+                const VAddr arena_base = window_arena->cpu_addr;
+                memory_tracker->ForEachDownloadRange<false>(
+                    start, window_bytes, [&](u64 address, u64 range_size) {
+                        gpu_modified_ranges.ForEachInRange(
+                            address, range_size, [&](VAddr range_start, VAddr range_end) {
+                                const u64 copy_size = range_end - range_start;
+                                copies.push_back(vk::BufferCopy{
+                                    .srcOffset = range_start - arena_base,
+                                    .dstOffset = total_size_bytes,
+                                    .size = copy_size,
+                                });
+                                // Align up to avoid cache conflicts
+                                total_size_bytes += Common::AlignUp(copy_size, 64ULL);
+                            });
+                        gpu_modified_ranges.Subtract(address, range_size);
+                    });
+                pending.push_back(PendingWindow{
+                    .arena = window_arena,
+                    .start = start,
+                    .size = window_bytes,
+                    .first_copy = first_copy,
+                    .num_copies = copies.size() - first_copy,
+                });
+            };
+            collect(arena, window_start, window_end - window_start);
             for (const auto& window : hot_windows) {
                 if (window.end == 0 || window.start == window_start ||
                     flush_start - window.last_fault_ns > HotWindowLifetimeNs ||
@@ -302,13 +335,49 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
                 }
                 const auto* hot_arena =
                     GetArena(window.start >> block_shift, (window.end - 1) >> block_shift);
-                const u64 before = readback_stats.downloads.load(std::memory_order_relaxed);
-                DownloadMemory(hot_arena, window.start, window.end - window.start);
-                if (readback_stats.downloads.load(std::memory_order_relaxed) != before) {
+                collect(hot_arena, window.start, window.end - window.start);
+                if (pending.back().num_copies != 0) {
                     readback_stats.prefetches.fetch_add(1, std::memory_order_relaxed);
                 }
             }
+            if (total_size_bytes != 0) {
+                readback_stats.downloads.fetch_add(1, std::memory_order_relaxed);
+                readback_stats.ranges.fetch_add(copies.size(), std::memory_order_relaxed);
+                readback_stats.bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
+                const auto download =
+                    staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached);
+                for (auto& copy : copies) {
+                    copy.dstOffset += download.offset;
+                }
+                for (const auto& window : pending) {
+                    if (window.num_copies != 0) {
+                        runtime.CopyBuffer(
+                            window.arena, download.buffer,
+                            std::span{copies.data() + window.first_copy, window.num_copies});
+                    }
+                }
+                scheduler.Finish();
+
+                download.buffer->Invalidate(download.offset, download.size);
+                for (const auto& window : pending) {
+                    for (size_t i = 0; i < window.num_copies; ++i) {
+                        const auto& copy = copies[window.first_copy + i];
+                        auto* dst_addr =
+                            std::bit_cast<u8*>(window.arena->cpu_addr + copy.srcOffset);
+                        memory->TryWriteBacking(
+                            dst_addr, download.mapped + (copy.dstOffset - download.offset),
+                            copy.size);
+                    }
+                }
+            }
+            for (const auto& window : pending) {
+                memory_tracker->UnmarkRegionAsGpuModified(window.start, window.size, false);
+            }
         }
+        if (is_write) {
+            memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+        }
+        downloaded = readback_stats.downloads.load(std::memory_order_relaxed) != downloads_before;
         flush_end = ReadbackStats::Now();
     };
     const s64 start = ReadbackStats::Now();
