@@ -35,6 +35,7 @@ namespace VideoCore {
 // Texture cache statistics, defined in texture_cache.cpp.
 void TextureCacheNoteTexelSync();
 void TextureCacheNoteBufferRead(bool synced);
+void TextureCacheNoteBufferOverlapRead();
 
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
 static constexpr size_t NULL_INDEX_BUFFER_SIZE = 16;
@@ -305,6 +306,18 @@ bool IsRenderedImageAt(VideoCore::TextureCache& texture_cache, VAddr device_addr
         device_addr, [&](VideoCore::ImageId, VideoCore::Image& image) {
             if (image.info.guest_address == device_addr &&
                 True(image.flags & VideoCore::ImageFlagBits::GpuModified) &&
+                (image.usage.render_target || image.usage.depth_target || image.usage.storage)) {
+                found = true;
+            }
+        });
+    return found;
+}
+
+bool OverlapsRenderedImage(VideoCore::TextureCache& texture_cache, VAddr device_addr, u32 size) {
+    bool found = false;
+    texture_cache.ForEachImageInRegion(
+        device_addr, size, [&](VideoCore::ImageId, VideoCore::Image& image) {
+            if (True(image.flags & VideoCore::ImageFlagBits::GpuModified) &&
                 (image.usage.render_target || image.usage.depth_target || image.usage.storage)) {
                 found = true;
             }
@@ -599,6 +612,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         !texture_cache.IsMeta(device_addr) && IsRenderedImageAt(texture_cache, device_addr)) {
         sync_image = GetBufferImageMode() == BufferImageMode::Sync;
         TextureCacheNoteBufferRead(sync_image);
+    } else if (!is_written && GetBufferImageMode() != BufferImageMode::Off &&
+               OverlapsRenderedImage(texture_cache, device_addr, size)) {
+        TextureCacheNoteBufferOverlapRead();
     }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && !sync_image && size <= STREAM_THRESHOLD &&
