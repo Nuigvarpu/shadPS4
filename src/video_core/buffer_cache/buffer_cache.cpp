@@ -5,6 +5,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
@@ -133,38 +137,78 @@ u64 ReadbackWindowSize() {
     return window;
 }
 
-/// Lightweight statistics about guest-triggered GPU readbacks, logged about once per second.
+/// Statistics about guest-triggered GPU readbacks, logged about once per second, to find out
+/// where synchronization time goes and which memory the guest keeps reading back.
 struct ReadbackStats {
-    std::atomic<u64> faults{};
-    std::atomic<u64> downloads{};
-    std::atomic<u64> bytes{};
-    std::atomic<u64> stall_ns{};
-    std::atomic<s64> window_start_ns{};
+    struct Region {
+        u32 reads;
+        u32 writes;
+    };
 
-    void Report(u64 stalled_ns) {
-        faults.fetch_add(1, std::memory_order_relaxed);
-        stall_ns.fetch_add(stalled_ns, std::memory_order_relaxed);
-        const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now().time_since_epoch())
-                            .count();
-        s64 start = window_start_ns.load(std::memory_order_relaxed);
-        if (start == 0) {
-            window_start_ns.compare_exchange_strong(start, now, std::memory_order_relaxed);
+    std::mutex mutex;
+    u64 faults{};
+    u64 write_faults{};
+    u64 gpu_thread_faults{};
+    u64 empty_faults{};
+    u64 queue_ns{};
+    u64 flush_ns{};
+    s64 window_start_ns{};
+    std::unordered_map<VAddr, Region> regions;
+    std::atomic<u64> downloads{};
+    std::atomic<u64> ranges{};
+    std::atomic<u64> bytes{};
+
+    static s64 Now() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
+
+    void Report(VAddr addr, bool is_write, bool gpu_thread, bool downloaded, u64 waited_queue_ns,
+                u64 waited_flush_ns) {
+        std::scoped_lock lk{mutex};
+        ++faults;
+        write_faults += is_write ? 1 : 0;
+        gpu_thread_faults += gpu_thread ? 1 : 0;
+        empty_faults += downloaded ? 0 : 1;
+        queue_ns += waited_queue_ns;
+        flush_ns += waited_flush_ns;
+        auto& region = regions[addr >> 16];
+        ++(is_write ? region.writes : region.reads);
+
+        const s64 now = Now();
+        if (window_start_ns == 0) {
+            window_start_ns = now;
             return;
         }
-        const s64 elapsed = now - start;
-        if (elapsed < 1'000'000'000 ||
-            !window_start_ns.compare_exchange_strong(start, now, std::memory_order_relaxed)) {
+        const s64 elapsed = now - window_start_ns;
+        if (elapsed < 1'000'000'000) {
             return;
         }
-        const u64 f = faults.exchange(0, std::memory_order_relaxed);
-        const u64 d = downloads.exchange(0, std::memory_order_relaxed);
-        const u64 b = bytes.exchange(0, std::memory_order_relaxed);
-        const u64 s = stall_ns.exchange(0, std::memory_order_relaxed);
-        LOG_INFO(
-            Render,
-            "Readbacks: {} faults, {} downloads, {} KB, {:.1f} ms stalled in the last {:.1f} s", f,
-            d, b / 1024, static_cast<double>(s) / 1e6, static_cast<double>(elapsed) / 1e9);
+        std::vector<std::pair<VAddr, Region>> hot(regions.begin(), regions.end());
+        const size_t num_hot = std::min<size_t>(hot.size(), 6);
+        std::partial_sort(
+            hot.begin(), hot.begin() + num_hot, hot.end(), [](const auto& a, const auto& b) {
+                return a.second.reads + a.second.writes > b.second.reads + b.second.writes;
+            });
+        std::string hot_list;
+        for (size_t i = 0; i < num_hot; ++i) {
+            hot_list += fmt::format(" {:#x}:{}r/{}w", hot[i].first << 16, hot[i].second.reads,
+                                    hot[i].second.writes);
+        }
+        LOG_INFO(Render,
+                 "Readbacks: {} faults ({} write, {} from GPU thread, {} empty), {} downloads ({} "
+                 "ranges), {} KB, waited {:.1f} ms in queue + {:.1f} ms flushing in {:.1f} s, "
+                 "{} regions; hot 64K regions:{}",
+                 faults, write_faults, gpu_thread_faults, empty_faults,
+                 downloads.exchange(0, std::memory_order_relaxed),
+                 ranges.exchange(0, std::memory_order_relaxed),
+                 bytes.exchange(0, std::memory_order_relaxed) / 1024,
+                 static_cast<double>(queue_ns) / 1e6, static_cast<double>(flush_ns) / 1e6,
+                 static_cast<double>(elapsed) / 1e9, regions.size(), hot_list);
+        faults = write_faults = gpu_thread_faults = empty_faults = queue_ns = flush_ns = 0;
+        regions.clear();
+        window_start_ns = now;
     }
 };
 ReadbackStats readback_stats;
@@ -172,7 +216,13 @@ ReadbackStats readback_stats;
 } // Anonymous namespace
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
-    const auto flush_request = [this, device_addr, size, is_write] {
+    s64 flush_start = 0;
+    s64 flush_end = 0;
+    bool downloaded = false;
+    const auto flush_request = [this, device_addr, size, is_write, &flush_start, &flush_end,
+                                &downloaded] {
+        flush_start = ReadbackStats::Now();
+        const u64 downloads_before = readback_stats.downloads.load(std::memory_order_relaxed);
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
         const auto* arena = GetArena(first_block, last_block);
@@ -189,16 +239,18 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
+        downloaded = readback_stats.downloads.load(std::memory_order_relaxed) != downloads_before;
+        flush_end = ReadbackStats::Now();
     };
-    const auto start = std::chrono::steady_clock::now();
+    const s64 start = ReadbackStats::Now();
     if (assume_locks) {
         flush_request();
     } else {
         liverpool->SendCommand<true>(std::move(flush_request));
     }
-    readback_stats.Report(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                              std::chrono::steady_clock::now() - start)
-                              .count());
+    readback_stats.Report(device_addr, is_write, assume_locks, downloaded,
+                          static_cast<u64>(flush_start - start),
+                          static_cast<u64>(flush_end - flush_start));
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
@@ -226,6 +278,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         return;
     }
     readback_stats.downloads.fetch_add(1, std::memory_order_relaxed);
+    readback_stats.ranges.fetch_add(copies.size(), std::memory_order_relaxed);
     readback_stats.bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
     const auto download = staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached);
     for (auto& copy : copies) {
