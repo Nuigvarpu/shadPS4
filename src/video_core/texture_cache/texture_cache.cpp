@@ -30,6 +30,9 @@ static constexpr u32 MAX_IMAGES = std::numeric_limits<u16>::max();
 static constexpr u32 MAX_IMAGE_VIEWS = std::numeric_limits<u16>::max();
 static constexpr u32 MAX_SAMPLERS = std::numeric_limits<u16>::max();
 
+/// Experiment selected by the flicker lab (see vk_presenter.cpp); 0 means normal behaviour.
+std::atomic<u32> g_flicker_lab_mode{0};
+
 namespace {
 
 /// Per-second texture cache counters, to see whether images are being recreated or refreshed in a
@@ -114,7 +117,7 @@ bool ExtendedGpuInvalidation() {
                  value ? "enabled" : "disabled");
         return value;
     }();
-    return enabled;
+    return enabled || g_flicker_lab_mode.load(std::memory_order_relaxed) == 3;
 }
 
 bool IsRenderedImage(const Image& image) {
