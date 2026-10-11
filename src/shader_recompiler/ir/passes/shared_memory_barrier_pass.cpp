@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <string_view>
 #include <unordered_set>
+#include "common/logging/log.h"
 #include "shader_recompiler/ir/breadth_first_search.h"
 #include "shader_recompiler/ir/ir_emitter.h"
 #include "shader_recompiler/ir/program.h"
@@ -119,6 +122,23 @@ static NodeSet FindDivergentLoops(const IR::AbstractSyntaxList& syntax_list) {
 
 static constexpr u32 GcnSubgroupSize = 64;
 
+/// Debug switch: SHADPS4_LDS_SYNC=1 also synchronizes shared memory with workgroup barriers in
+/// workgroups larger than one GCN wave when the host subgroup is narrower than 64 lanes. GCN code
+/// may rely on the 64 lanes of a wave running in lockstep even in large workgroups (per-wave
+/// scratch areas, reduction tails), which does not hold when a wave is split across two host
+/// subgroups. Inside divergent control flow, where a workgroup barrier is not allowed, subgroup
+/// barriers keep at least the order within each host subgroup.
+static bool ExtendedLdsSync() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_LDS_SYNC");
+        const bool value = env != nullptr && std::string_view{env} == "1";
+        LOG_INFO(Render_Recompiler, "Extended shared memory synchronization: {}",
+                 value ? "enabled" : "disabled");
+        return value;
+    }();
+    return enabled;
+}
+
 void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_info,
                              const Profile& profile) {
     if (program.info.hw_stage != HwStage::Compute) {
@@ -133,7 +153,9 @@ void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_in
     }
     // The compiler can only omit barriers when the local workgroup size is the same as the HW
     // subgroup.
-    if (threadgroup_size != GcnSubgroupSize || !profile.needs_lds_barriers) {
+    const bool extended =
+        profile.needs_lds_barriers && threadgroup_size > GcnSubgroupSize && ExtendedLdsSync();
+    if ((threadgroup_size != GcnSubgroupSize || !profile.needs_lds_barriers) && !extended) {
         // GCN waves can use shared memory between invocations without explicit barriers because
         // they run in lockstep. Host compilers can reorder these accesses, so keep their order
         // with subgroup memory barriers.
@@ -173,8 +195,12 @@ void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_in
             }
             continue;
         }
-        if (node.type == Type::Block && divergence_depth == 0) {
-            EmitBarrierInBlock(node.data.block);
+        if (node.type == Type::Block) {
+            if (divergence_depth == 0) {
+                EmitBarrierInBlock(node.data.block);
+            } else if (extended) {
+                EmitBarrierInBlock(node.data.block, true);
+            }
         }
     }
 }
