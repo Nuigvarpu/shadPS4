@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
@@ -107,6 +110,67 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
     });
 }
 
+namespace {
+
+/// Size of the window downloaded around a CPU read of GPU-modified memory. Larger windows mean
+/// fewer GPU synchronizations when the guest reads many nearby addresses, at the cost of copying
+/// more data per fault. Can be tuned with SHADPS4_READBACK_WINDOW_KB (power of two, 64..65536).
+u64 ReadbackWindowSize() {
+    static const u64 window = []() -> u64 {
+        constexpr u64 Default = 512_KB;
+        const char* env = std::getenv("SHADPS4_READBACK_WINDOW_KB");
+        if (env == nullptr) {
+            return Default;
+        }
+        const u64 kb = std::strtoull(env, nullptr, 10);
+        if (kb < 64 || kb > 65536 || (kb & (kb - 1)) != 0) {
+            LOG_WARNING(Render, "Ignoring invalid SHADPS4_READBACK_WINDOW_KB={}", env);
+            return Default;
+        }
+        LOG_INFO(Render, "Readback window size: {} KB", kb);
+        return kb * 1_KB;
+    }();
+    return window;
+}
+
+/// Lightweight statistics about guest-triggered GPU readbacks, logged about once per second.
+struct ReadbackStats {
+    std::atomic<u64> faults{};
+    std::atomic<u64> downloads{};
+    std::atomic<u64> bytes{};
+    std::atomic<u64> stall_ns{};
+    std::atomic<s64> window_start_ns{};
+
+    void Report(u64 stalled_ns) {
+        faults.fetch_add(1, std::memory_order_relaxed);
+        stall_ns.fetch_add(stalled_ns, std::memory_order_relaxed);
+        const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        s64 start = window_start_ns.load(std::memory_order_relaxed);
+        if (start == 0) {
+            window_start_ns.compare_exchange_strong(start, now, std::memory_order_relaxed);
+            return;
+        }
+        const s64 elapsed = now - start;
+        if (elapsed < 1'000'000'000 ||
+            !window_start_ns.compare_exchange_strong(start, now, std::memory_order_relaxed)) {
+            return;
+        }
+        const u64 f = faults.exchange(0, std::memory_order_relaxed);
+        const u64 d = downloads.exchange(0, std::memory_order_relaxed);
+        const u64 b = bytes.exchange(0, std::memory_order_relaxed);
+        const u64 s = stall_ns.exchange(0, std::memory_order_relaxed);
+        LOG_INFO(
+            Render,
+            "Readbacks: {} faults, {} downloads, {} KB, {:.1f} ms stalled in the last {:.1f} s", f,
+            d, b / 1024, static_cast<double>(s) / 1e6, static_cast<double>(elapsed) / 1e9);
+    }
+};
+ReadbackStats readback_stats;
+
+} // Anonymous namespace
+
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
     const auto flush_request = [this, device_addr, size, is_write] {
         const u32 first_block = device_addr >> block_shift;
@@ -115,22 +179,26 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
 
         // GPU-modified ranges come as many small scattered islands,
         // so the download is widened to a window around the request
-        constexpr u64 WindowSize = 512_KB;
+        const u64 window_size = ReadbackWindowSize();
         const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
         const VAddr window_start =
-            std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), arena->cpu_addr);
+            std::max<VAddr>(Common::AlignDown(device_addr, window_size), arena->cpu_addr);
         const VAddr window_end = std::min<VAddr>(
-            std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
+            std::max<VAddr>(window_start + window_size, device_addr + size), arena_end);
         DownloadMemory(arena, window_start, window_end - window_start);
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
     };
+    const auto start = std::chrono::steady_clock::now();
     if (assume_locks) {
         flush_request();
     } else {
         liverpool->SendCommand<true>(std::move(flush_request));
     }
+    readback_stats.Report(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - start)
+                              .count());
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
@@ -157,6 +225,8 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     if (total_size_bytes == 0) {
         return;
     }
+    readback_stats.downloads.fetch_add(1, std::memory_order_relaxed);
+    readback_stats.bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
     const auto download = staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached);
     for (auto& copy : copies) {
         copy.dstOffset += download.offset;
