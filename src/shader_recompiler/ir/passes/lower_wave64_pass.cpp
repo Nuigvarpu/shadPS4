@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 #include "common/logging/classes.h"
@@ -111,6 +113,16 @@ static std::optional<std::vector<const IR::Block*>> FindDivergentLoops(const IR:
     return divergent_loops;
 }
 
+// Debug switch: SHADPS4_WAVE64_LOOPS=legacy treats every loop as divergent, which was the
+// behaviour before uniform loops were detected.
+static bool LegacyLoopHandling() {
+    static const bool legacy = [] {
+        const char* env = std::getenv("SHADPS4_WAVE64_LOOPS");
+        return env != nullptr && std::string_view{env} == "legacy";
+    }();
+    return legacy;
+}
+
 static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program) {
     using Type = IR::AbstractSyntaxNode::Type;
 
@@ -142,7 +154,8 @@ static std::vector<IR::Block*> FindUniformBlocks(const IR::Program& program) {
             conditionals.pop_back();
             break;
         case Type::Loop: {
-            const bool divergent = std::ranges::contains(*divergent_loops, node.data.loop.merge);
+            const bool divergent = LegacyLoopHandling() ||
+                                   std::ranges::contains(*divergent_loops, node.data.loop.merge);
             loops.push_back({node.data.loop.merge, divergent});
             divergence_depth += static_cast<u32>(divergent);
             break;
