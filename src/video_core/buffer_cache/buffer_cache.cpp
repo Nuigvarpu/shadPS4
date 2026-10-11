@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -161,6 +162,8 @@ struct ReadbackStats {
     std::atomic<u64> bytes{};
     std::atomic<u64> skipped{};
     std::atomic<u64> prefetches{};
+    std::atomic<u64> async_jobs{};
+    std::atomic<u64> async_wait_ns{};
 
     static s64 Now() {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -203,7 +206,8 @@ struct ReadbackStats {
         LOG_INFO(Render,
                  "Readbacks: {} faults ({} write, {} from GPU thread, {} empty, {} skipped), {} "
                  "downloads ({} prefetched, {} ranges), {} KB, waited {:.1f} ms in queue + {:.1f} "
-                 "ms flushing in {:.1f} s, {} regions; hot 64K regions:{}",
+                 "ms flushing in {:.1f} s, {} asynchronous ({:.1f} ms waited off the GPU thread), "
+                 "{} regions; hot 64K regions:{}",
                  faults, write_faults, gpu_thread_faults, empty_faults,
                  skipped.exchange(0, std::memory_order_relaxed),
                  downloads.exchange(0, std::memory_order_relaxed),
@@ -211,7 +215,8 @@ struct ReadbackStats {
                  ranges.exchange(0, std::memory_order_relaxed),
                  bytes.exchange(0, std::memory_order_relaxed) / 1024,
                  static_cast<double>(queue_ns) / 1e6, static_cast<double>(flush_ns) / 1e6,
-                 static_cast<double>(elapsed) / 1e9, regions.size(), hot_list);
+                 static_cast<double>(elapsed) / 1e9, async_jobs.exchange(0),
+                 static_cast<double>(async_wait_ns.exchange(0)) / 1e6, regions.size(), hot_list);
         faults = write_faults = gpu_thread_faults = empty_faults = queue_ns = flush_ns = 0;
         regions.clear();
         window_start_ns = now;
@@ -256,6 +261,67 @@ void RememberHotWindow(VAddr start, VAddr end, s64 now) {
     *slot = HotWindow{.start = start, .end = end, .last_fault_ns = now};
 }
 
+/// Whether readbacks requested by guest threads wait for the GPU on the faulting thread instead
+/// of the GPU thread, so command processing continues meanwhile. Can be disabled with
+/// SHADPS4_READBACK_ASYNC=0.
+bool ReadbackAsyncEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_READBACK_ASYNC");
+        const bool value = env == nullptr || std::string_view{env} != "0";
+        LOG_INFO(Render, "Asynchronous readbacks: {}", value ? "enabled" : "disabled");
+        return value;
+    }();
+    return enabled;
+}
+
+/// A guest memory range whose GPU-written data is being downloaded.
+struct ReadbackWindow {
+    const VideoCore::Buffer* arena;
+    VAddr start;
+    u64 size;
+    size_t first_copy;
+    size_t num_copies;
+};
+
+/// A batch of readback windows downloaded with one GPU submission. The windows stay protected
+/// until the data has been written back to guest memory.
+struct AsyncReadback {
+    boost::container::small_vector<ReadbackWindow, 17> windows;
+    boost::container::small_vector<vk::BufferCopy, 64> copies;
+    Vulkan::StagingBufferRef staging{};
+    u64 tick = 0;
+    bool finished = false; // GPU thread only
+    std::mutex write_mutex;
+    bool written = false;
+
+    bool Overlaps(VAddr start, VAddr end) const {
+        return std::ranges::any_of(windows, [&](const ReadbackWindow& window) {
+            return window.start < end && start < window.start + window.size;
+        });
+    }
+
+    /// Copies the downloaded data into guest memory. Safe to call from several threads.
+    void WriteBack(Core::MemoryManager* memory) {
+        std::scoped_lock lk{write_mutex};
+        if (written) {
+            return;
+        }
+        staging.buffer->Invalidate(staging.offset, staging.size);
+        for (const auto& window : windows) {
+            for (size_t i = 0; i < window.num_copies; ++i) {
+                const auto& copy = copies[window.first_copy + i];
+                auto* dst_addr = std::bit_cast<u8*>(window.arena->cpu_addr + copy.srcOffset);
+                memory->TryWriteBacking(
+                    dst_addr, staging.mapped + (copy.dstOffset - staging.offset), copy.size);
+            }
+        }
+        written = true;
+    }
+};
+
+/// Asynchronous readbacks still in flight. Only accessed from the GPU thread.
+std::vector<std::shared_ptr<AsyncReadback>> async_readbacks;
+
 } // Anonymous namespace
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
@@ -265,11 +331,33 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         readback_stats.skipped.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    const bool prefetch = ReadbackPrefetchEnabled();
+    const bool use_async = !is_write && !assume_locks && prefetch && ReadbackAsyncEnabled();
+
+    // Runs on the GPU thread once an asynchronous readback has been written back. Windows the GPU
+    // wrote to again in the meantime stay protected, so the guest faults and reads them again.
+    const auto finish_async = [this](const std::shared_ptr<AsyncReadback>& job) {
+        if (job->finished) {
+            return;
+        }
+        job->finished = true;
+        for (const auto& window : job->windows) {
+            bool rewritten = false;
+            gpu_modified_ranges.ForEachInRange(window.start, window.size,
+                                               [&](VAddr, VAddr) { rewritten = true; });
+            if (!rewritten) {
+                memory_tracker->UnmarkRegionAsGpuModified(window.start, window.size, false);
+            }
+        }
+        staging_pool.FreeDeferred(job->staging);
+        std::erase(async_readbacks, job);
+    };
+
     s64 flush_start = 0;
     s64 flush_end = 0;
     bool downloaded = false;
-    const auto flush_request = [this, device_addr, size, is_write, &flush_start, &flush_end,
-                                &downloaded] {
+    std::shared_ptr<AsyncReadback> async_job;
+    const auto flush_request = [&] {
         flush_start = ReadbackStats::Now();
         const u64 downloads_before = readback_stats.downloads.load(std::memory_order_relaxed);
         const u32 first_block = device_addr >> block_shift;
@@ -285,30 +373,43 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         const VAddr window_end = std::min<VAddr>(
             std::max<VAddr>(window_start + window_size, device_addr + size), arena_end);
         RememberHotWindow(window_start, window_end, flush_start);
-        if (!ReadbackPrefetchEnabled()) {
+
+        if (use_async) {
+            // Another thread is already waiting for this data; wait for the same download.
+            for (const auto& job : async_readbacks) {
+                if (job->Overlaps(window_start, window_end)) {
+                    async_job = job;
+                    flush_end = ReadbackStats::Now();
+                    return;
+                }
+            }
+        } else {
+            // Pending asynchronous downloads must land in guest memory before anything else
+            // looks at those pages.
+            const auto pending = async_readbacks;
+            for (const auto& job : pending) {
+                scheduler.Wait(job->tick);
+                job->WriteBack(memory);
+                finish_async(job);
+            }
+        }
+
+        if (!prefetch) {
             DownloadMemory(arena, window_start, window_end - window_start);
         } else {
             // Download the faulting window together with the other windows the guest keeps
-            // reading back, using a single GPU synchronization for all of them.
-            struct PendingWindow {
-                const Buffer* arena;
-                VAddr start;
-                u64 size;
-                size_t first_copy;
-                size_t num_copies;
-            };
-            boost::container::small_vector<PendingWindow, 17> pending;
-            boost::container::small_vector<vk::BufferCopy, 64> copies;
+            // reading back, using a single GPU submission for all of them.
+            auto job = std::make_shared<AsyncReadback>();
             u64 total_size_bytes = 0;
             const auto collect = [&](const Buffer* window_arena, VAddr start, u64 window_bytes) {
-                const size_t first_copy = copies.size();
+                const size_t first_copy = job->copies.size();
                 const VAddr arena_base = window_arena->cpu_addr;
                 memory_tracker->ForEachDownloadRange<false>(
                     start, window_bytes, [&](u64 address, u64 range_size) {
                         gpu_modified_ranges.ForEachInRange(
                             address, range_size, [&](VAddr range_start, VAddr range_end) {
                                 const u64 copy_size = range_end - range_start;
-                                copies.push_back(vk::BufferCopy{
+                                job->copies.push_back(vk::BufferCopy{
                                     .srcOffset = range_start - arena_base,
                                     .dstOffset = total_size_bytes,
                                     .size = copy_size,
@@ -318,60 +419,67 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
                             });
                         gpu_modified_ranges.Subtract(address, range_size);
                     });
-                pending.push_back(PendingWindow{
+                job->windows.push_back(ReadbackWindow{
                     .arena = window_arena,
                     .start = start,
                     .size = window_bytes,
                     .first_copy = first_copy,
-                    .num_copies = copies.size() - first_copy,
+                    .num_copies = job->copies.size() - first_copy,
                 });
             };
             collect(arena, window_start, window_end - window_start);
             for (const auto& window : hot_windows) {
                 if (window.end == 0 || window.start == window_start ||
                     flush_start - window.last_fault_ns > HotWindowLifetimeNs ||
-                    !memory_tracker->IsRegionGpuModified(window.start, window.end - window.start)) {
+                    !memory_tracker->IsRegionGpuModified(window.start, window.end - window.start) ||
+                    std::ranges::any_of(async_readbacks, [&](const auto& pending) {
+                        return pending->Overlaps(window.start, window.end);
+                    })) {
                     continue;
                 }
                 const auto* hot_arena =
                     GetArena(window.start >> block_shift, (window.end - 1) >> block_shift);
                 collect(hot_arena, window.start, window.end - window.start);
-                if (pending.back().num_copies != 0) {
+                if (job->windows.back().num_copies != 0) {
                     readback_stats.prefetches.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+
+            // Windows without GPU-written data need no download.
+            for (const auto& window : job->windows) {
+                if (window.num_copies == 0) {
+                    memory_tracker->UnmarkRegionAsGpuModified(window.start, window.size, false);
                 }
             }
             if (total_size_bytes != 0) {
                 readback_stats.downloads.fetch_add(1, std::memory_order_relaxed);
-                readback_stats.ranges.fetch_add(copies.size(), std::memory_order_relaxed);
+                readback_stats.ranges.fetch_add(job->copies.size(), std::memory_order_relaxed);
                 readback_stats.bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
-                const auto download =
-                    staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached);
-                for (auto& copy : copies) {
-                    copy.dstOffset += download.offset;
+                job->staging = staging_pool.Request(
+                    total_size_bytes, VideoCore::MemoryType::HostCached, 0, use_async);
+                for (auto& copy : job->copies) {
+                    copy.dstOffset += job->staging.offset;
                 }
-                for (const auto& window : pending) {
+                for (const auto& window : job->windows) {
                     if (window.num_copies != 0) {
                         runtime.CopyBuffer(
-                            window.arena, download.buffer,
-                            std::span{copies.data() + window.first_copy, window.num_copies});
+                            window.arena, job->staging.buffer,
+                            std::span{job->copies.data() + window.first_copy, window.num_copies});
                     }
                 }
-                scheduler.Finish();
-
-                download.buffer->Invalidate(download.offset, download.size);
-                for (const auto& window : pending) {
-                    for (size_t i = 0; i < window.num_copies; ++i) {
-                        const auto& copy = copies[window.first_copy + i];
-                        auto* dst_addr =
-                            std::bit_cast<u8*>(window.arena->cpu_addr + copy.srcOffset);
-                        memory->TryWriteBacking(
-                            dst_addr, download.mapped + (copy.dstOffset - download.offset),
-                            copy.size);
+                if (use_async) {
+                    // Submit without waiting; the faulting thread waits for the data itself.
+                    job->tick = scheduler.CurrentTick();
+                    scheduler.Flush();
+                    async_readbacks.push_back(job);
+                    async_job = job;
+                } else {
+                    scheduler.Finish();
+                    job->WriteBack(memory);
+                    for (const auto& window : job->windows) {
+                        memory_tracker->UnmarkRegionAsGpuModified(window.start, window.size, false);
                     }
                 }
-            }
-            for (const auto& window : pending) {
-                memory_tracker->UnmarkRegionAsGpuModified(window.start, window.size, false);
             }
         }
         if (is_write) {
@@ -384,7 +492,16 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     if (assume_locks) {
         flush_request();
     } else {
-        liverpool->SendCommand<true>(std::move(flush_request));
+        liverpool->SendCommand<true>(flush_request);
+    }
+    if (async_job) {
+        const s64 wait_start = ReadbackStats::Now();
+        scheduler.GetWorkSemaphore()->Wait(async_job->tick);
+        async_job->WriteBack(memory);
+        readback_stats.async_jobs.fetch_add(1, std::memory_order_relaxed);
+        readback_stats.async_wait_ns.fetch_add(ReadbackStats::Now() - wait_start,
+                                               std::memory_order_relaxed);
+        liverpool->SendCommand<true>([&] { finish_async(async_job); });
     }
     readback_stats.Report(device_addr, is_write, assume_locks, downloaded,
                           static_cast<u64>(flush_start - start),
