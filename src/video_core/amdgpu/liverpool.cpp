@@ -29,6 +29,8 @@ std::atomic<u64> g_gpu_wait_count{};
 std::atomic<u64> g_gpu_wait_cp_ns{};
 std::atomic<u64> g_submit_ns{};
 std::atomic<u64> g_submit_count{};
+std::atomic<u64> g_finish_wait_ns{};
+std::atomic<u64> g_finish_wait_count{};
 thread_local bool g_is_command_processor_thread = false;
 
 namespace {
@@ -49,6 +51,8 @@ struct CommandProcessorStats {
     u64 resumes = 0;
     u64 yields = 0;
     u64 frames = 0;
+    u64 gds_finishes = 0;
+    u64 gds_finish_ns = 0;
 
     void MaybeReport() {
         const s64 now = NowNs();
@@ -64,12 +68,14 @@ struct CommandProcessorStats {
         LOG_INFO(Render,
                  "GPU thread: {} frames, {:.1f} ms in command buffers ({} resumes, {} yielded), "
                  "{:.1f} ms in queued commands, {:.1f} ms submitting frames, {:.1f} ms idle in "
-                 "{:.1f} s; GPU waits: {} ({:.1f} ms, {:.1f} ms on this thread); queue submits: "
-                 "{} ({:.1f} ms)",
+                 "{:.1f} s; GPU waits: {} ({:.1f} ms, {:.1f} ms on this thread), of which {} "
+                 "full finishes ({:.1f} ms) and {} GDS fence finishes ({:.1f} ms); queue "
+                 "submits: {} ({:.1f} ms)",
                  frames, ms(task_ns), resumes, yields, ms(command_ns), ms(submit_ns), ms(idle_ns),
                  static_cast<double>(elapsed) / 1e9, g_gpu_wait_count.exchange(0),
                  ms(g_gpu_wait_ns.exchange(0)), ms(g_gpu_wait_cp_ns.exchange(0)),
-                 g_submit_count.exchange(0), ms(g_submit_ns.exchange(0)));
+                 g_finish_wait_count.exchange(0), ms(g_finish_wait_ns.exchange(0)), gds_finishes,
+                 ms(gds_finish_ns), g_submit_count.exchange(0), ms(g_submit_ns.exchange(0)));
         *this = CommandProcessorStats{.window_start_ns = now};
     }
 };
@@ -739,7 +745,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
                     ASSERT(event_eos->size == 1);
                     if (rasterizer) {
+                        const s64 finish_start = NowNs();
                         rasterizer->Finish();
+                        cp_stats.gds_finish_ns += NowNs() - finish_start;
+                        ++cp_stats.gds_finishes;
                         const u32 value = rasterizer->ReadDataFromGds(event_eos->gds_index);
                         *event_eos->Address() = value;
                     }
