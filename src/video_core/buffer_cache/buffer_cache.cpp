@@ -36,6 +36,8 @@ namespace VideoCore {
 void TextureCacheNoteTexelSync();
 void TextureCacheNoteBufferRead(bool synced);
 void TextureCacheNoteBufferOverlapRead();
+// Experiment selected by the flicker lab, defined in texture_cache.cpp.
+extern std::atomic<u32> g_flicker_lab_mode;
 
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
 static constexpr size_t NULL_INDEX_BUFFER_SIZE = 16;
@@ -234,6 +236,9 @@ ReadbackStats readback_stats;
 /// recently hot ones while the GPU is already synchronized saves a full GPU wait per buffer.
 /// Can be disabled with SHADPS4_READBACK_PREFETCH=0.
 bool ReadbackPrefetchEnabled() {
+    if (g_flicker_lab_mode.load(std::memory_order_relaxed) == 1) {
+        return false;
+    }
     static const bool enabled = [] {
         const char* env = std::getenv("SHADPS4_READBACK_PREFETCH");
         const bool value = env == nullptr || std::string_view{env} != "0";
@@ -294,6 +299,9 @@ u64 HashGuestLine(Core::MemoryManager* memory, VAddr address) {
 /// of the GPU thread, so command processing continues meanwhile. Can be disabled with
 /// SHADPS4_READBACK_ASYNC=0.
 bool ReadbackAsyncEnabled() {
+    if (g_flicker_lab_mode.load(std::memory_order_relaxed) == 1) {
+        return false;
+    }
     static const bool enabled = [] {
         const char* env = std::getenv("SHADPS4_READBACK_ASYNC");
         const bool value = env == nullptr || std::string_view{env} != "0";
@@ -309,6 +317,9 @@ bool ReadbackAsyncEnabled() {
 enum class BufferImageMode { Off, Count, Sync };
 
 BufferImageMode GetBufferImageMode() {
+    if (g_flicker_lab_mode.load(std::memory_order_relaxed) == 4) {
+        return BufferImageMode::Sync;
+    }
     static const BufferImageMode mode = [] {
         const char* env = std::getenv("SHADPS4_BUF_IMAGE_SYNC");
         const std::string_view value = env != nullptr ? env : "";
@@ -649,6 +660,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
     bool sync_image = false;
+    bool sync_overlaps = false;
     if (!is_written && !is_texel_buffer && GetBufferImageMode() != BufferImageMode::Off &&
         !texture_cache.IsMeta(device_addr) && IsRenderedImageAt(texture_cache, device_addr)) {
         sync_image = GetBufferImageMode() == BufferImageMode::Sync;
@@ -656,9 +668,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     } else if (!is_written && GetBufferImageMode() != BufferImageMode::Off &&
                OverlapsRenderedImage(texture_cache, device_addr, size)) {
         TextureCacheNoteBufferOverlapRead();
+        sync_overlaps = g_flicker_lab_mode.load(std::memory_order_relaxed) == 6;
     }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
-    if (!is_written && !sync_image && size <= STREAM_THRESHOLD &&
+    if (!is_written && !sync_image && !sync_overlaps && size <= STREAM_THRESHOLD &&
         !IsRegionGpuModified(device_addr, size)) {
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         memory->CopySparseMemory(device_addr, data, size);
@@ -670,6 +683,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const auto* arena = GetArena(first_block, last_block);
     EnsureResident(arena, first_block, last_block);
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer || sync_image);
+    if (sync_overlaps) {
+        SynchronizeOverlappedImages(arena, device_addr, size);
+    }
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
     }
@@ -845,6 +861,34 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         return synced;
     }
     return false;
+}
+
+void BufferCache::SynchronizeOverlappedImages(const Buffer* arena, VAddr device_addr, u32 size) {
+    // Copy the contents of rendered images overlapping this buffer into it, so the buffer read
+    // sees what was rendered. Each image is copied again only after it was used again.
+    static std::unordered_map<VAddr, u64> synced_ticks;
+    boost::container::small_vector<std::pair<VAddr, u32>, 4> images;
+    texture_cache.ForEachImageInRegion(device_addr, size, [&](ImageId, Image& image) {
+        if (False(image.flags & ImageFlagBits::GpuModified) ||
+            !(image.usage.render_target || image.usage.depth_target || image.usage.storage)) {
+            return;
+        }
+        u64& synced_tick = synced_ticks[image.info.guest_address];
+        if (synced_tick == image.tick_accessed_last + 1) {
+            return;
+        }
+        synced_tick = image.tick_accessed_last + 1;
+        images.emplace_back(image.info.guest_address, image.info.guest_size);
+    });
+    for (const auto& [image_addr, image_size] : images) {
+        const u64 first_block = image_addr >> block_shift;
+        const u64 last_block = (image_addr + image_size - 1) >> block_shift;
+        if (GetArena(first_block, last_block) != arena) {
+            continue;
+        }
+        EnsureResident(arena, first_block, last_block);
+        SynchronizeMemoryFromImage(arena, image_addr, image_size);
+    }
 }
 
 bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size) {
