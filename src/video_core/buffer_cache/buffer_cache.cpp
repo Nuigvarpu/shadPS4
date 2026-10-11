@@ -32,6 +32,10 @@
 
 namespace VideoCore {
 
+// Texture cache statistics, defined in texture_cache.cpp.
+void TextureCacheNoteTexelSync();
+void TextureCacheNoteBufferRead(bool synced);
+
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
 static constexpr size_t NULL_INDEX_BUFFER_SIZE = 16;
 static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
@@ -272,6 +276,40 @@ bool ReadbackAsyncEnabled() {
         return value;
     }();
     return enabled;
+}
+
+/// Buffer reads of memory that holds a rendered image. The buffer cache does not see image
+/// writes, so such reads may observe stale data. SHADPS4_BUF_IMAGE_SYNC=1 copies the image into
+/// the buffer before the read (like read-only texel buffers already do); 0 disables detection.
+enum class BufferImageMode { Off, Count, Sync };
+
+BufferImageMode GetBufferImageMode() {
+    static const BufferImageMode mode = [] {
+        const char* env = std::getenv("SHADPS4_BUF_IMAGE_SYNC");
+        const std::string_view value = env != nullptr ? env : "";
+        const BufferImageMode result = value == "1"   ? BufferImageMode::Sync
+                                       : value == "0" ? BufferImageMode::Off
+                                                      : BufferImageMode::Count;
+        LOG_INFO(Render, "Buffer reads of rendered images: {}",
+                 result == BufferImageMode::Sync    ? "synchronized"
+                 : result == BufferImageMode::Count ? "counted"
+                                                    : "ignored");
+        return result;
+    }();
+    return mode;
+}
+
+bool IsRenderedImageAt(VideoCore::TextureCache& texture_cache, VAddr device_addr) {
+    bool found = false;
+    texture_cache.ForEachImageWithAddress(
+        device_addr, [&](VideoCore::ImageId, VideoCore::Image& image) {
+            if (image.info.guest_address == device_addr &&
+                True(image.flags & VideoCore::ImageFlagBits::GpuModified) &&
+                (image.usage.render_target || image.usage.depth_target || image.usage.storage)) {
+                found = true;
+            }
+        });
+    return found;
 }
 
 /// A guest memory range whose GPU-written data is being downloaded.
@@ -556,8 +594,15 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
+    bool sync_image = false;
+    if (!is_written && !is_texel_buffer && GetBufferImageMode() != BufferImageMode::Off &&
+        !texture_cache.IsMeta(device_addr) && IsRenderedImageAt(texture_cache, device_addr)) {
+        sync_image = GetBufferImageMode() == BufferImageMode::Sync;
+        TextureCacheNoteBufferRead(sync_image);
+    }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
-    if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
+    if (!is_written && !sync_image && size <= STREAM_THRESHOLD &&
+        !IsRegionGpuModified(device_addr, size)) {
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         memory->CopySparseMemory(device_addr, data, size);
         stream_buffer.Commit();
@@ -567,7 +612,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const u64 last_block = (device_addr + size - 1) >> block_shift;
     const auto* arena = GetArena(first_block, last_block);
     EnsureResident(arena, first_block, last_block);
-    SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+    SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer || sync_image);
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
     }
@@ -736,7 +781,11 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         runtime.CopyBuffer(staging.buffer, arena, copies);
     }
     if (is_texel_buffer && !is_written) {
-        return SynchronizeMemoryFromImage(arena, device_addr, size);
+        const bool synced = SynchronizeMemoryFromImage(arena, device_addr, size);
+        if (synced) {
+            TextureCacheNoteTexelSync();
+        }
+        return synced;
     }
     return false;
 }
