@@ -85,6 +85,19 @@ struct CommandProcessorStats {
 };
 CommandProcessorStats cp_stats;
 
+/// Debug switch: SHADPS4_SYNC_SUBMIT=1 makes every graphics submission synchronous: the
+/// submitting guest thread waits until the command processor has processed it and the GPU has
+/// executed it. Rules out timing-dependent differences caused by emulation latency.
+bool SynchronousSubmits() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_SYNC_SUBMIT");
+        const bool value = env != nullptr && std::string_view{env} == "1";
+        LOG_INFO(Render, "Synchronous submits: {}", value ? "enabled" : "disabled");
+        return value;
+    }();
+    return enabled;
+}
+
 /// Occlusion query results are not measured; every query reports a large visible pixel count.
 /// For debugging, SHADPS4_OCCLUSION_MODE=occluded makes every query report zero visible pixels
 /// instead, which shows which effects depend on occlusion queries.
@@ -218,6 +231,9 @@ void Liverpool::Process(std::stop_token stoken) {
 
             if (task.done()) {
                 task.destroy();
+                if (SynchronousSubmits() && rasterizer) {
+                    rasterizer->Finish();
+                }
 
                 std::scoped_lock lock{queue.m_access};
                 queue.submits.pop();
@@ -1255,9 +1271,14 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
         queue.submits.emplace(task.handle);
     }
 
-    std::scoped_lock lk{submit_mutex};
-    ++num_submits;
-    submit_cv.notify_one();
+    {
+        std::scoped_lock lk{submit_mutex};
+        ++num_submits;
+        submit_cv.notify_one();
+    }
+    if (SynchronousSubmits()) {
+        WaitGpuIdle();
+    }
 }
 
 void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
