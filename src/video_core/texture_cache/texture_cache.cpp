@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <limits>
+#include <string_view>
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -25,6 +29,87 @@ namespace VideoCore {
 static constexpr u32 MAX_IMAGES = std::numeric_limits<u16>::max();
 static constexpr u32 MAX_IMAGE_VIEWS = std::numeric_limits<u16>::max();
 static constexpr u32 MAX_SAMPLERS = std::numeric_limits<u16>::max();
+
+namespace {
+
+/// Per-second texture cache counters, to see whether images are being recreated or refreshed in a
+/// way that could lose GPU-rendered contents.
+struct TextureCacheStats {
+    std::atomic<u64> created{};
+    std::atomic<u64> pool_freed{};
+    std::atomic<u64> pool_kept{};
+    std::atomic<u64> tiling_freed{};
+    std::atomic<u64> tiling_kept{};
+    std::atomic<u64> chance_freed{};
+    std::atomic<u64> chance_kept{};
+    std::atomic<u64> depth_recreated{};
+    std::atomic<u64> expanded{};
+    std::atomic<u64> resolve_failed{};
+    std::atomic<u64> gc_freed{};
+    std::atomic<u64> uploads_cpu{};
+    std::atomic<u64> uploads_cpu_rendered{};
+    std::atomic<u64> uploads_gpu{};
+    std::atomic<u64> uploads_gpu_rendered{};
+    std::atomic<u64> upload_kb{};
+    std::atomic<u64> texel_syncs{};
+    std::atomic<u64> buffer_image_reads{};
+    std::atomic<u64> buffer_image_syncs{};
+    std::atomic<s64> last_report{};
+
+    void MaybeReport() {
+        const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        s64 last = last_report.load(std::memory_order_relaxed);
+        if (last == 0) {
+            last_report.compare_exchange_strong(last, now);
+            return;
+        }
+        if (now - last < 1000 || !last_report.compare_exchange_strong(last, now)) {
+            return;
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Texture cache: {} images created; pool overlaps {} freed / {} kept; tiling "
+                 "overlaps {} / {}; chance overlaps {} / {}; {} depth recreations, {} expansions, "
+                 "{} failed resolves, {} GC frees; uploads: {} from CPU writes ({} over rendered "
+                 "images), {} from GPU buffer writes ({} over rendered images), {} KB; {} "
+                 "texel-buffer image syncs; {} buffer "
+                 "reads of rendered images ({} synced)",
+                 created.exchange(0), pool_freed.exchange(0), pool_kept.exchange(0),
+                 tiling_freed.exchange(0), tiling_kept.exchange(0), chance_freed.exchange(0),
+                 chance_kept.exchange(0), depth_recreated.exchange(0), expanded.exchange(0),
+                 resolve_failed.exchange(0), gc_freed.exchange(0), uploads_cpu.exchange(0),
+                 uploads_cpu_rendered.exchange(0), uploads_gpu.exchange(0),
+                 uploads_gpu_rendered.exchange(0), upload_kb.exchange(0), texel_syncs.exchange(0),
+                 buffer_image_reads.exchange(0), buffer_image_syncs.exchange(0));
+    }
+};
+TextureCacheStats tc_stats;
+
+/// Debug switch: SHADPS4_TC_POOL=keep never deletes a recently used image when another image is
+/// placed at an overlapping address, so both stay alive instead of the old one being recreated.
+bool KeepOverlappedImages() {
+    static const bool keep = [] {
+        const char* env = std::getenv("SHADPS4_TC_POOL");
+        const bool value = env != nullptr && std::string_view{env} == "keep";
+        LOG_INFO(Render_Vulkan, "Overlapped image deletion: {}", value ? "never" : "default");
+        return value;
+    }();
+    return keep;
+}
+
+} // Anonymous namespace
+
+void TextureCacheNoteTexelSync() {
+    ++tc_stats.texel_syncs;
+}
+
+void TextureCacheNoteBufferRead(bool synced) {
+    ++tc_stats.buffer_image_reads;
+    if (synced) {
+        ++tc_stats.buffer_image_syncs;
+    }
+}
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
@@ -235,6 +320,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
     }
 
     if (recreate) {
+        ++tc_stats.depth_recreated;
         auto new_info = requested_info;
         new_info.resources = std::max(requested_info.resources, cache_image.info.resources);
         new_info.UpdateSize();
@@ -271,6 +357,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 
     auto& cache_image = slot_images[cache_image_id];
     const bool safe_to_delete =
+        !KeepOverlappedImages() &&
         scheduler.CurrentTick() - cache_image.tick_accessed_last > NUM_FRAMES_BEFORE_REMOVAL;
 
     // Equal address
@@ -281,7 +368,10 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             lhs_block_size != rhs_block_size) {
             // Very likely this kind of overlap is caused by allocation from a pool.
             if (safe_to_delete) {
+                ++tc_stats.pool_freed;
                 FreeImage(cache_image_id);
+            } else {
+                ++tc_stats.pool_kept;
             }
             return {merged_image_id, -1, -1};
         }
@@ -329,7 +419,10 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         // Likely the address is reused for a image with a different tiling mode.
         if (image_info.tile_mode != cache_image.info.tile_mode) {
             if (safe_to_delete) {
+                ++tc_stats.tiling_freed;
                 FreeImage(cache_image_id);
+            } else {
+                ++tc_stats.tiling_kept;
             }
             return {merged_image_id, -1, -1};
         }
@@ -462,7 +555,10 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 
         // Image isn't a subresource but a chance overlap.
         if (safe_to_delete) {
+            ++tc_stats.chance_freed;
             FreeImage(cache_image_id);
+        } else {
+            ++tc_stats.chance_kept;
         }
 
         return {{}, -1, -1};
@@ -496,6 +592,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
+    ++tc_stats.expanded;
     const auto new_image_id = slot_images.Insert(instance, runtime, slot_image_views, info);
     RegisterImage(new_image_id);
 
@@ -574,14 +671,17 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             // The image was clearly picked up wrong.
             FreeImage(image_id);
             image_id = {};
+            ++tc_stats.resolve_failed;
             LOG_WARNING(Render_Vulkan, "Image overlap resolve failed");
         }
     }
     // Create and register a new image
     if (!image_id) {
+        ++tc_stats.created;
         image_id = slot_images.Insert(instance, runtime, slot_image_views, info);
         RegisterImage(image_id);
     }
+    tc_stats.MaybeReport();
 
     Image& image = slot_images[image_id];
     image.tick_accessed_last = scheduler.CurrentTick();
@@ -646,8 +746,10 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
         std::unique_lock lk{download_images_mutex};
         download_images.emplace(image_id);
     }
-    image.usage.render_target = 1u;
+    // Mark the usage after the update so uploads over previously rendered images can be told
+    // apart from the first upload of a new render target.
     UpdateImage(image_id);
+    image.usage.render_target = 1u;
 
     // Register meta data for this color buffer
     if (desc.info.meta_info.cmask_addr) {
@@ -668,8 +770,8 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
 ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
-    image.usage.depth_target = 1u;
     UpdateImage(image_id);
+    image.usage.depth_target = 1u;
 
     // Register meta data for this depth buffer
     if (desc.info.meta_info.htile_addr) {
@@ -773,6 +875,19 @@ void TextureCache::RefreshImage(Image& image) {
         image.flags &= ~ImageFlagBits::Dirty;
         return;
     }
+
+    if (is_gpu_dirty) {
+        ++tc_stats.uploads_gpu;
+        if (image.usage.render_target || image.usage.depth_target) {
+            ++tc_stats.uploads_gpu_rendered;
+        }
+    } else {
+        ++tc_stats.uploads_cpu;
+        if (image.usage.render_target || image.usage.depth_target) {
+            ++tc_stats.uploads_cpu_rendered;
+        }
+    }
+    tc_stats.upload_kb += image.info.guest_size / 1024;
 
     scheduler.EndRendering();
 
@@ -956,6 +1071,7 @@ void TextureCache::GarbageCollectImages() {
         if (download) {
             DownloadImageMemory(image_id);
         }
+        ++tc_stats.gc_freed;
         FreeImage(image_id);
         if (total_used_memory < critical_gc_memory) {
             if (aggresive) {
