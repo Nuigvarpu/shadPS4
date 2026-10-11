@@ -266,6 +266,30 @@ void RememberHotWindow(VAddr start, VAddr end, s64 now) {
     *slot = HotWindow{.start = start, .end = end, .last_fault_ns = now};
 }
 
+/// Debug switch: SHADPS4_READBACK_TRACE=1 logs every guest fault on GPU-written memory with a
+/// hash of the data the guest will read, to see whether that data changes between frames.
+bool ReadbackTraceEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_READBACK_TRACE");
+        const bool value = env != nullptr && std::string_view{env} == "1";
+        LOG_INFO(Render, "Readback trace: {}", value ? "enabled" : "disabled");
+        return value;
+    }();
+    return enabled;
+}
+
+std::atomic<u64> readback_trace_lines{};
+
+u64 HashGuestLine(Core::MemoryManager* memory, VAddr address) {
+    std::array<u8, 64> line{};
+    memory->CopySparseMemory(address & ~VAddr{63}, line.data(), line.size());
+    u64 hash = 1469598103934665603ULL;
+    for (const u8 byte : line) {
+        hash = (hash ^ byte) * 1099511628211ULL;
+    }
+    return hash;
+}
+
 /// Whether readbacks requested by guest threads wait for the GPU on the faulting thread instead
 /// of the GPU thread, so command processing continues meanwhile. Can be disabled with
 /// SHADPS4_READBACK_ASYNC=0.
@@ -557,6 +581,23 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     readback_stats.Report(device_addr, is_write, assume_locks, downloaded,
                           static_cast<u64>(flush_start - start),
                           static_cast<u64>(flush_end - flush_start));
+    if (ReadbackTraceEnabled() && readback_trace_lines.fetch_add(1) < 30000) {
+        u64 copies = 0;
+        u64 copy_bytes = 0;
+        if (async_job) {
+            copies = async_job->copies.size();
+            for (const auto& copy : async_job->copies) {
+                copy_bytes += copy.size;
+            }
+        }
+        LOG_INFO(Render,
+                 "Readback trace: addr={:#x} size={} {} {} downloaded={} async={} copies={} "
+                 "bytes={} line_hash={:016x} still_gpu_modified={}",
+                 device_addr, size, is_write ? "write" : "read",
+                 assume_locks ? "gpu-thread" : "guest", downloaded, async_job != nullptr, copies,
+                 copy_bytes, HashGuestLine(memory, device_addr),
+                 memory_tracker->IsRegionGpuModified(device_addr, size));
+    }
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
