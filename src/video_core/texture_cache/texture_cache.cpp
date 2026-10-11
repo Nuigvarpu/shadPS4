@@ -54,6 +54,9 @@ struct TextureCacheStats {
     std::atomic<u64> texel_syncs{};
     std::atomic<u64> buffer_image_reads{};
     std::atomic<u64> buffer_image_syncs{};
+    std::atomic<u64> buffer_image_overlap_reads{};
+    std::atomic<u64> gpu_write_overlaps{};
+    std::atomic<u64> stale_texture_binds{};
     std::atomic<s64> last_report{};
 
     void MaybeReport() {
@@ -74,14 +77,17 @@ struct TextureCacheStats {
                  "{} failed resolves, {} GC frees; uploads: {} from CPU writes ({} over rendered "
                  "images), {} from GPU buffer writes ({} over rendered images), {} KB; {} "
                  "texel-buffer image syncs; {} buffer "
-                 "reads of rendered images ({} synced)",
+                 "reads of rendered images ({} synced), {} partially overlapping; {} images inside "
+                 "GPU-written buffers, {} texture binds over GPU-written memory not refreshed",
                  created.exchange(0), pool_freed.exchange(0), pool_kept.exchange(0),
                  tiling_freed.exchange(0), tiling_kept.exchange(0), chance_freed.exchange(0),
                  chance_kept.exchange(0), depth_recreated.exchange(0), expanded.exchange(0),
                  resolve_failed.exchange(0), gc_freed.exchange(0), uploads_cpu.exchange(0),
                  uploads_cpu_rendered.exchange(0), uploads_gpu.exchange(0),
                  uploads_gpu_rendered.exchange(0), upload_kb.exchange(0), texel_syncs.exchange(0),
-                 buffer_image_reads.exchange(0), buffer_image_syncs.exchange(0));
+                 buffer_image_reads.exchange(0), buffer_image_syncs.exchange(0),
+                 buffer_image_overlap_reads.exchange(0), gpu_write_overlaps.exchange(0),
+                 stale_texture_binds.exchange(0));
     }
 };
 TextureCacheStats tc_stats;
@@ -98,7 +104,28 @@ bool KeepOverlappedImages() {
     return keep;
 }
 
+/// Debug switch: SHADPS4_TC_GPU_SYNC=1 reuploads sampled images whose memory was written by GPU
+/// buffer operations even when the write did not start at the image address.
+bool ExtendedGpuInvalidation() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_TC_GPU_SYNC");
+        const bool value = env != nullptr && std::string_view{env} == "1";
+        LOG_INFO(Render_Vulkan, "Extended GPU write invalidation: {}",
+                 value ? "enabled" : "disabled");
+        return value;
+    }();
+    return enabled;
+}
+
+bool IsRenderedImage(const Image& image) {
+    return image.usage.render_target || image.usage.depth_target || image.usage.storage;
+}
+
 } // Anonymous namespace
+
+void TextureCacheNoteBufferOverlapRead() {
+    ++tc_stats.buffer_image_overlap_reads;
+}
 
 void TextureCacheNoteTexelSync() {
     ++tc_stats.texel_syncs;
@@ -258,6 +285,16 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         // Only consider images that match base address.
         // TODO: Maybe also consider subresources
         if (image.info.guest_address != address) {
+            // Sampled images placed entirely inside the written range, e.g. one half of a
+            // double-buffered allocation, may also have been overwritten.
+            if (image.info.guest_address > address &&
+                image.info.guest_address + image.info.guest_size <= address + max_size &&
+                !IsRenderedImage(image)) {
+                ++tc_stats.gpu_write_overlaps;
+                if (ExtendedGpuInvalidation()) {
+                    image.flags |= ImageFlagBits::GpuDirty;
+                }
+            }
             return;
         }
         // Ensure image is reuploaded when accessed again.
@@ -727,6 +764,16 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
 
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
+    if (desc.type != BindingType::Storage && !IsRenderedImage(image) &&
+        False(image.flags & ImageFlagBits::Dirty) &&
+        buffer_cache.IsRegionGpuModified(image.info.guest_address, image.info.guest_size)) {
+        // The memory of this sampled image was written by GPU buffer operations, and the image
+        // was not marked for reupload, so it may hold stale contents.
+        ++tc_stats.stale_texture_binds;
+        if (ExtendedGpuInvalidation()) {
+            image.flags |= ImageFlagBits::GpuDirty;
+        }
+    }
     if (desc.type == BindingType::Storage) {
         image.flags |= ImageFlagBits::GpuModified;
         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
