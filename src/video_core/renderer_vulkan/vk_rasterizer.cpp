@@ -27,6 +27,11 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 
+namespace VideoCore {
+// Experiment selected by the flicker lab, defined in texture_cache.cpp.
+extern std::atomic<u32> g_flicker_lab_mode;
+} // namespace VideoCore
+
 namespace Vulkan {
 
 namespace {
@@ -36,6 +41,9 @@ namespace {
 enum class DebugBarriers { None, Compute, All };
 
 DebugBarriers DebugBarrierMode() {
+    if (VideoCore::g_flicker_lab_mode.load(std::memory_order_relaxed) == 5) {
+        return DebugBarriers::All;
+    }
     static const DebugBarriers mode = [] {
         const char* env = std::getenv("SHADPS4_DEBUG_BARRIERS");
         const std::string_view value = env ? env : "";
