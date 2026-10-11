@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <chrono>
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
@@ -19,6 +21,61 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace AmdGpu {
+
+// Timing of GPU waits and queue submissions, filled in by the Vulkan scheduler and reported once
+// per second by the command processor thread.
+std::atomic<u64> g_gpu_wait_ns{};
+std::atomic<u64> g_gpu_wait_count{};
+std::atomic<u64> g_gpu_wait_cp_ns{};
+std::atomic<u64> g_submit_ns{};
+std::atomic<u64> g_submit_count{};
+thread_local bool g_is_command_processor_thread = false;
+
+namespace {
+
+s64 NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+/// Where the command processor thread spends its time, logged about once per second.
+struct CommandProcessorStats {
+    s64 window_start_ns = 0;
+    u64 idle_ns = 0;
+    u64 task_ns = 0;
+    u64 command_ns = 0;
+    u64 submit_ns = 0;
+    u64 resumes = 0;
+    u64 yields = 0;
+    u64 frames = 0;
+
+    void MaybeReport() {
+        const s64 now = NowNs();
+        if (window_start_ns == 0) {
+            window_start_ns = now;
+            return;
+        }
+        const s64 elapsed = now - window_start_ns;
+        if (elapsed < 1'000'000'000) {
+            return;
+        }
+        const auto ms = [](u64 ns) { return static_cast<double>(ns) / 1e6; };
+        LOG_INFO(Render,
+                 "GPU thread: {} frames, {:.1f} ms in command buffers ({} resumes, {} yielded), "
+                 "{:.1f} ms in queued commands, {:.1f} ms submitting frames, {:.1f} ms idle in "
+                 "{:.1f} s; GPU waits: {} ({:.1f} ms, {:.1f} ms on this thread); queue submits: "
+                 "{} ({:.1f} ms)",
+                 frames, ms(task_ns), resumes, yields, ms(command_ns), ms(submit_ns), ms(idle_ns),
+                 static_cast<double>(elapsed) / 1e9, g_gpu_wait_count.exchange(0),
+                 ms(g_gpu_wait_ns.exchange(0)), ms(g_gpu_wait_cp_ns.exchange(0)),
+                 g_submit_count.exchange(0), ms(g_submit_ns.exchange(0)));
+        *this = CommandProcessorStats{.window_start_ns = now};
+    }
+};
+CommandProcessorStats cp_stats;
+
+} // Anonymous namespace
 
 static const char* dcb_task_name{"DCB_TASK"};
 static const char* ccb_task_name{"CCB_TASK"};
@@ -92,15 +149,18 @@ void Liverpool::ProcessCommands() {
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
     gpu_id = std::this_thread::get_id();
+    g_is_command_processor_thread = true;
 #ifdef __linux__
     gpu_tid = gettid();
 #endif
 
     while (!stoken.stop_requested()) {
         {
+            const s64 idle_start = NowNs();
             std::unique_lock lk{submit_mutex};
             Common::CondvarWait(submit_cv, lk, stoken,
                                 [this] { return num_commands || num_submits || submit_done; });
+            cp_stats.idle_ns += NowNs() - idle_start;
         }
         if (stoken.stop_requested()) {
             break;
@@ -111,7 +171,9 @@ void Liverpool::Process(std::stop_token stoken) {
         curr_qid = -1;
 
         while (num_submits || num_commands) {
+            const s64 command_start = NowNs();
             ProcessCommands();
+            cp_stats.command_ns += NowNs() - command_start;
 
             curr_qid = (curr_qid + 1) % num_mapped_queues;
 
@@ -125,7 +187,11 @@ void Liverpool::Process(std::stop_token stoken) {
                 }
                 task = queue.submits.front();
             }
+            const s64 task_start = NowNs();
             task.resume();
+            cp_stats.task_ns += NowNs() - task_start;
+            ++cp_stats.resumes;
+            cp_stats.yields += task.done() ? 0 : 1;
 
             if (task.done()) {
                 task.destroy();
@@ -140,13 +206,17 @@ void Liverpool::Process(std::stop_token stoken) {
         }
 
         if (submit_done) {
+            const s64 submit_start = NowNs();
             VideoCore::EndCapture();
             if (rasterizer) {
                 rasterizer->OnSubmit();
                 rasterizer->Flush();
             }
             submit_done = false;
+            cp_stats.submit_ns += NowNs() - submit_start;
+            ++cp_stats.frames;
         }
+        cp_stats.MaybeReport();
 
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }
