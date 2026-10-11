@@ -1486,8 +1486,13 @@ StencilFace ResolveStencilFace(AmdGpu::CompareFunc func, AmdGpu::StencilFunc fai
     };
     const bool compares = func != CompareFunc::Always && func != CompareFunc::Never;
     const u8 write_mask = ref.stencil_write_mask;
-    if (!uses(StencilFunc::ReplaceOp) || !compares ||
-        (ref.stencil_test_val & write_mask) == (ref.stencil_op_val & write_mask)) {
+    if (!uses(StencilFunc::ReplaceOp) || !compares) {
+        return legacy;
+    }
+    if ((ref.stencil_test_val & write_mask) == (ref.stencil_op_val & write_mask)) {
+        // Both values agree on every written bit (e.g. a test-only pass with a zero write mask),
+        // so REPLACE with the test value writes the same result and the comparison stays exact.
+        legacy.reference = ref.stencil_test_val;
         return legacy;
     }
 
