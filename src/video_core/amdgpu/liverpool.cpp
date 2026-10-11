@@ -3,6 +3,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <string_view>
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
@@ -53,6 +55,7 @@ struct CommandProcessorStats {
     u64 frames = 0;
     u64 gds_finishes = 0;
     u64 gds_finish_ns = 0;
+    u64 occlusion_dumps = 0;
 
     void MaybeReport() {
         const s64 now = NowNs();
@@ -70,16 +73,30 @@ struct CommandProcessorStats {
                  "{:.1f} ms in queued commands, {:.1f} ms submitting frames, {:.1f} ms idle in "
                  "{:.1f} s; GPU waits: {} ({:.1f} ms, {:.1f} ms on this thread), of which {} "
                  "full finishes ({:.1f} ms) and {} GDS fence finishes ({:.1f} ms); queue "
-                 "submits: {} ({:.1f} ms)",
+                 "submits: {} ({:.1f} ms); {} occlusion query dumps",
                  frames, ms(task_ns), resumes, yields, ms(command_ns), ms(submit_ns), ms(idle_ns),
                  static_cast<double>(elapsed) / 1e9, g_gpu_wait_count.exchange(0),
                  ms(g_gpu_wait_ns.exchange(0)), ms(g_gpu_wait_cp_ns.exchange(0)),
                  g_finish_wait_count.exchange(0), ms(g_finish_wait_ns.exchange(0)), gds_finishes,
-                 ms(gds_finish_ns), g_submit_count.exchange(0), ms(g_submit_ns.exchange(0)));
+                 ms(gds_finish_ns), g_submit_count.exchange(0), ms(g_submit_ns.exchange(0)),
+                 occlusion_dumps);
         *this = CommandProcessorStats{.window_start_ns = now};
     }
 };
 CommandProcessorStats cp_stats;
+
+/// Occlusion query results are not measured; every query reports a large visible pixel count.
+/// For debugging, SHADPS4_OCCLUSION_MODE=occluded makes every query report zero visible pixels
+/// instead, which shows which effects depend on occlusion queries.
+bool OcclusionQueriesReportOccluded() {
+    static const bool occluded = [] {
+        const char* env = std::getenv("SHADPS4_OCCLUSION_MODE");
+        const bool value = env != nullptr && std::string_view{env} == "occluded";
+        LOG_INFO(Render, "Occlusion queries report: {}", value ? "occluded" : "visible");
+        return value;
+    }();
+    return occluded;
+}
 
 } // Anonymous namespace
 
@@ -728,7 +745,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
                             *results = pixel_counter | OcclusionCounterValidMask;
                         }
-                        pixel_counter += OcclusionCounterStep;
+                        if (!OcclusionQueriesReportOccluded()) {
+                            pixel_counter += OcclusionCounterStep;
+                        }
+                        ++cp_stats.occlusion_dumps;
                     }
                 }
                 break;
