@@ -2,11 +2,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 #include <magic_enum/magic_enum.hpp>
@@ -157,6 +159,8 @@ struct ReadbackStats {
     std::atomic<u64> downloads{};
     std::atomic<u64> ranges{};
     std::atomic<u64> bytes{};
+    std::atomic<u64> skipped{};
+    std::atomic<u64> prefetches{};
 
     static s64 Now() {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -197,11 +201,13 @@ struct ReadbackStats {
                                     hot[i].second.writes);
         }
         LOG_INFO(Render,
-                 "Readbacks: {} faults ({} write, {} from GPU thread, {} empty), {} downloads ({} "
-                 "ranges), {} KB, waited {:.1f} ms in queue + {:.1f} ms flushing in {:.1f} s, "
-                 "{} regions; hot 64K regions:{}",
+                 "Readbacks: {} faults ({} write, {} from GPU thread, {} empty, {} skipped), {} "
+                 "downloads ({} prefetched, {} ranges), {} KB, waited {:.1f} ms in queue + {:.1f} "
+                 "ms flushing in {:.1f} s, {} regions; hot 64K regions:{}",
                  faults, write_faults, gpu_thread_faults, empty_faults,
+                 skipped.exchange(0, std::memory_order_relaxed),
                  downloads.exchange(0, std::memory_order_relaxed),
+                 prefetches.exchange(0, std::memory_order_relaxed),
                  ranges.exchange(0, std::memory_order_relaxed),
                  bytes.exchange(0, std::memory_order_relaxed) / 1024,
                  static_cast<double>(queue_ns) / 1e6, static_cast<double>(flush_ns) / 1e6,
@@ -213,9 +219,52 @@ struct ReadbackStats {
 };
 ReadbackStats readback_stats;
 
+/// Whether readback windows that the guest keeps faulting on are downloaded together with the
+/// faulting one. Games often read back several GPU-written buffers every frame; downloading the
+/// recently hot ones while the GPU is already synchronized saves a full GPU wait per buffer.
+/// Can be disabled with SHADPS4_READBACK_PREFETCH=0.
+bool ReadbackPrefetchEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_READBACK_PREFETCH");
+        const bool value = env == nullptr || std::string_view{env} != "0";
+        LOG_INFO(Render, "Readback prefetch: {}", value ? "enabled" : "disabled");
+        return value;
+    }();
+    return enabled;
+}
+
+/// Readback windows the guest recently faulted on. Only accessed from the GPU thread.
+struct HotWindow {
+    VAddr start;
+    VAddr end;
+    s64 last_fault_ns;
+};
+constexpr s64 HotWindowLifetimeNs = 2'000'000'000;
+std::array<HotWindow, 16> hot_windows{};
+
+void RememberHotWindow(VAddr start, VAddr end, s64 now) {
+    HotWindow* slot = nullptr;
+    for (auto& window : hot_windows) {
+        if (window.start == start && window.end == end) {
+            window.last_fault_ns = now;
+            return;
+        }
+        if (!slot || window.last_fault_ns < slot->last_fault_ns) {
+            slot = &window;
+        }
+    }
+    *slot = HotWindow{.start = start, .end = end, .last_fault_ns = now};
+}
+
 } // Anonymous namespace
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
+    if (!is_write && !assume_locks && !memory_tracker->IsRegionGpuModified(device_addr, size)) {
+        // Another thread downloaded this data while the fault was being raised; the access can
+        // simply be retried without synchronizing with the GPU again.
+        readback_stats.skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     s64 flush_start = 0;
     s64 flush_end = 0;
     bool downloaded = false;
@@ -240,6 +289,26 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
         downloaded = readback_stats.downloads.load(std::memory_order_relaxed) != downloads_before;
+
+        RememberHotWindow(window_start, window_end, flush_start);
+        if (ReadbackPrefetchEnabled()) {
+            // The GPU is idle now, so the other hot windows can be downloaded cheaply before
+            // the guest faults on them.
+            for (const auto& window : hot_windows) {
+                if (window.end == 0 || window.start == window_start ||
+                    flush_start - window.last_fault_ns > HotWindowLifetimeNs ||
+                    !memory_tracker->IsRegionGpuModified(window.start, window.end - window.start)) {
+                    continue;
+                }
+                const auto* hot_arena =
+                    GetArena(window.start >> block_shift, (window.end - 1) >> block_shift);
+                const u64 before = readback_stats.downloads.load(std::memory_order_relaxed);
+                DownloadMemory(hot_arena, window.start, window.end - window.start);
+                if (readback_stats.downloads.load(std::memory_order_relaxed) != before) {
+                    readback_stats.prefetches.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
         flush_end = ReadbackStats::Now();
     };
     const s64 start = ReadbackStats::Now();
@@ -275,6 +344,9 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         gpu_modified_ranges.Subtract(address, size);
     });
     if (total_size_bytes == 0) {
+        // No GPU-written data is left in this range. Clear the page state anyway, otherwise the
+        // pages stay protected and every later access faults and waits for the GPU for nothing.
+        memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
         return;
     }
     readback_stats.downloads.fetch_add(1, std::memory_order_relaxed);
