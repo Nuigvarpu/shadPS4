@@ -22,6 +22,11 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
+namespace VideoCore {
+// Experiment selected by the flicker lab, defined in texture_cache.cpp.
+extern std::atomic<u32> g_flicker_lab_mode;
+} // namespace VideoCore
+
 namespace AmdGpu {
 
 // Timing of GPU waits and queue submissions, filled in by the Vulkan scheduler and reported once
@@ -95,7 +100,7 @@ bool SynchronousSubmits() {
         LOG_INFO(Render, "Synchronous submits: {}", value ? "enabled" : "disabled");
         return value;
     }();
-    return enabled;
+    return enabled || VideoCore::g_flicker_lab_mode.load(std::memory_order_relaxed) == 2;
 }
 
 /// Occlusion query results are not measured; every query reports a large visible pixel count.
