@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <optional>
+#include <string_view>
 #include <unordered_set>
 
 #include "common/debug.h"
@@ -24,6 +28,81 @@
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace Vulkan {
+
+namespace {
+
+/// Debug switch to rule out missing synchronization: SHADPS4_DEBUG_BARRIERS=compute inserts a
+/// full memory barrier around every compute dispatch, =all also after every draw.
+enum class DebugBarriers { None, Compute, All };
+
+DebugBarriers DebugBarrierMode() {
+    static const DebugBarriers mode = [] {
+        const char* env = std::getenv("SHADPS4_DEBUG_BARRIERS");
+        const std::string_view value = env ? env : "";
+        const DebugBarriers result = value == "all"       ? DebugBarriers::All
+                                     : value == "compute" ? DebugBarriers::Compute
+                                                          : DebugBarriers::None;
+        LOG_INFO(Render_Vulkan, "Debug barriers: {}",
+                 result == DebugBarriers::All       ? "all"
+                 : result == DebugBarriers::Compute ? "compute"
+                                                    : "off");
+        return result;
+    }();
+    return mode;
+}
+
+void FullMemoryBarrier(Scheduler& scheduler) {
+    scheduler.EndRendering();
+    const vk::MemoryBarrier2 barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+    };
+    scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &barrier,
+    });
+}
+
+/// Counts passes the rasterizer handles specially instead of drawing, logged once per second.
+struct SpecialPassStats {
+    std::atomic<u64> fast_clear_eliminations{};
+    std::atomic<u64> fmask_decompressions{};
+    std::atomic<u64> resolves{};
+    std::atomic<u64> no_primitive_draws{};
+    std::atomic<u64> depth_stencil_copies{};
+    std::atomic<u64> hle_dispatches{};
+    std::atomic<u64> draws{};
+    std::atomic<u64> dispatches{};
+    std::atomic<s64> window_start_ns{};
+
+    void MaybeReport() {
+        const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        s64 start = window_start_ns.load(std::memory_order_relaxed);
+        if (start == 0) {
+            window_start_ns.store(now, std::memory_order_relaxed);
+            return;
+        }
+        if (now - start < 1'000'000'000) {
+            return;
+        }
+        window_start_ns.store(now, std::memory_order_relaxed);
+        LOG_INFO(Render_Vulkan,
+                 "Passes: {} draws, {} dispatches, {} fast clear eliminations, {} skipped FMask "
+                 "decompressions, {} resolves, {} draws without primitives, {} depth-stencil "
+                 "copies, {} HLE dispatches",
+                 draws.exchange(0), dispatches.exchange(0), fast_clear_eliminations.exchange(0),
+                 fmask_decompressions.exchange(0), resolves.exchange(0),
+                 no_primitive_draws.exchange(0), depth_stencil_copies.exchange(0),
+                 hle_dispatches.exchange(0));
+    }
+};
+SpecialPassStats special_pass_stats;
+
+} // Anonymous namespace
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -60,25 +139,30 @@ Rasterizer::~Rasterizer() = default;
 
 bool Rasterizer::FilterDraw() {
     const auto& regs = liverpool->regs;
+    special_pass_stats.MaybeReport();
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::EliminateFastClear) {
         // Clears the render target if FCE is launched before any draws
+        ++special_pass_stats.fast_clear_eliminations;
         EliminateFastClear();
         return false;
     }
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::FmaskDecompress) {
         // TODO: check for a valid MRT1 to promote the draw to the resolve pass.
         LOG_TRACE(Render_Vulkan, "FMask decompression pass skipped");
+        ++special_pass_stats.fmask_decompressions;
         ScopedMarkerInsert("FmaskDecompress");
         EliminateFastClear();
         return false;
     }
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Resolve) {
         LOG_TRACE(Render_Vulkan, "Resolve pass");
+        ++special_pass_stats.resolves;
         Resolve();
         return false;
     }
     if (regs.primitive_type == AmdGpu::PrimitiveType::None) {
         LOG_TRACE(Render_Vulkan, "Primitive type 'None' skipped");
+        ++special_pass_stats.no_primitive_draws;
         ScopedMarkerInsert("PrimitiveTypeNone");
         return false;
     }
@@ -99,6 +183,7 @@ bool Rasterizer::FilterDraw() {
         // do a copy from one depth-stencil surface to another, without a pixel shader.
         // We need to detect this case and perform the copy, otherwise it will have no effect.
         LOG_TRACE(Render_Vulkan, "Performing depth-stencil override copy");
+        ++special_pass_stats.depth_stencil_copies;
         DepthStencilCopy(depth_copy, stencil_copy);
         return false;
     }
@@ -233,6 +318,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                     instance_offset);
     }
     DebugState.IncDrawCall();
+    ++special_pass_stats.draws;
+    if (DebugBarrierMode() == DebugBarriers::All) {
+        FullMemoryBarrier(scheduler);
+    }
 
     ResetBindings(false);
 }
@@ -314,6 +403,10 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         }
         DebugState.IncDrawCall();
     }
+    ++special_pass_stats.draws;
+    if (DebugBarrierMode() == DebugBarriers::All) {
+        FullMemoryBarrier(scheduler);
+    }
 
     ResetBindings(false);
 }
@@ -331,6 +424,7 @@ void Rasterizer::DispatchDirect() {
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
+        ++special_pass_stats.hle_dispatches;
         return;
     }
 
@@ -343,12 +437,19 @@ void Rasterizer::DispatchDirect() {
     }
 
     scheduler.EndRendering();
+    if (DebugBarrierMode() != DebugBarriers::None) {
+        FullMemoryBarrier(scheduler);
+    }
     pipeline->BindResources(set_writes, push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     DebugState.IncDispatch();
+    ++special_pass_stats.dispatches;
+    if (DebugBarrierMode() != DebugBarriers::None) {
+        FullMemoryBarrier(scheduler);
+    }
 
     ResetBindings(true);
 }
@@ -377,12 +478,19 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     }
 
     scheduler.EndRendering();
+    if (DebugBarrierMode() != DebugBarriers::None) {
+        FullMemoryBarrier(scheduler);
+    }
     pipeline->BindResources(set_writes, push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
     DebugState.IncDispatch();
+    ++special_pass_stats.dispatches;
+    if (DebugBarrierMode() != DebugBarriers::None) {
+        FullMemoryBarrier(scheduler);
+    }
 
     ResetBindings(true);
 }
