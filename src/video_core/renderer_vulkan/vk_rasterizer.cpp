@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "common/debug.h"
@@ -58,6 +59,89 @@ DebugBarriers DebugBarrierMode() {
     }();
     return mode;
 }
+
+/// Debug switch: SHADPS4_DRAW_DIFF=1 logs, for every guest submission, the pipelines whose number
+/// of draws or drawn elements changed compared to the previous submission. On a static scene this
+/// shows whether an object that flickers is drawn only every other frame (decided on the CPU) or
+/// drawn every frame with different data (decided on the GPU).
+bool DrawDiffEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_DRAW_DIFF");
+        const bool value = env != nullptr && std::string_view{env} == "1";
+        LOG_INFO(Render_Vulkan, "Draw diff: {}", value ? "enabled" : "disabled");
+        return value;
+    }();
+    return enabled;
+}
+
+struct DrawDiffTracker {
+    struct Entry {
+        u64 vs{};
+        u64 ps{};
+        u32 draws{};
+        u32 indirect{};
+        u64 elements{};
+    };
+    std::unordered_map<u64, Entry> current;
+    std::unordered_map<u64, Entry> previous;
+    u64 frame{};
+    u64 lines{};
+
+    void Note(const GraphicsPipeline* pipeline, u64 elements, bool indirect) {
+        const auto stages = pipeline->GetStages();
+        const auto* vs = stages[static_cast<u32>(Shader::SwStage::Vertex)];
+        const auto* ps = stages[static_cast<u32>(Shader::SwStage::Fragment)];
+        const u64 vs_hash = vs ? vs->pgm_hash : 0;
+        const u64 ps_hash = ps ? ps->pgm_hash : 0;
+        auto& entry = current[vs_hash * 0x9E3779B97F4A7C15ULL ^ ps_hash];
+        entry.vs = vs_hash;
+        entry.ps = ps_hash;
+        ++entry.draws;
+        entry.indirect += indirect ? 1 : 0;
+        entry.elements += elements;
+    }
+
+    void EndFrame() {
+        u32 total_draws = 0;
+        for (const auto& [key, entry] : current) {
+            total_draws += entry.draws;
+        }
+        u32 changed = 0;
+        const auto report = [&](const Entry& now, const Entry& before) {
+            if (now.draws == before.draws && now.elements == before.elements) {
+                return;
+            }
+            ++changed;
+            if (lines < 40000) {
+                ++lines;
+                LOG_INFO(Render_Vulkan,
+                         "Draw diff: frame {} vs={:#x} ps={:#x} draws {} -> {} ({} indirect), "
+                         "elements {} -> {}",
+                         frame, now.vs | before.vs, now.ps | before.ps, before.draws, now.draws,
+                         now.indirect | before.indirect, before.elements, now.elements);
+            }
+        };
+        for (const auto& [key, entry] : current) {
+            const auto it = previous.find(key);
+            report(entry, it != previous.end() ? it->second : Entry{});
+        }
+        for (const auto& [key, entry] : previous) {
+            if (!current.contains(key)) {
+                report(Entry{}, entry);
+            }
+        }
+        if (lines < 40000) {
+            ++lines;
+            LOG_INFO(Render_Vulkan,
+                     "Draw diff: frame {} done, {} draws in {} pipelines, {} changed", frame,
+                     total_draws, current.size(), changed);
+        }
+        previous.swap(current);
+        current.clear();
+        ++frame;
+    }
+};
+DrawDiffTracker draw_diff;
 
 void FullMemoryBarrier(Scheduler& scheduler) {
     scheduler.EndRendering();
@@ -325,6 +409,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
                     instance_offset);
     }
+    if (DrawDiffEnabled()) {
+        draw_diff.Note(pipeline, u64(regs.num_indices) * u64(regs.num_instances.NumInstances()),
+                       false);
+    }
     DebugState.IncDrawCall();
     ++special_pass_stats.draws;
     if (DebugBarrierMode() == DebugBarriers::All) {
@@ -410,6 +498,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             cmdbuf.drawIndirect(buffer->Handle(), base, max_count, stride);
         }
         DebugState.IncDrawCall();
+    }
+    if (DrawDiffEnabled()) {
+        draw_diff.Note(pipeline, 0, true);
     }
     ++special_pass_stats.draws;
     if (DebugBarrierMode() == DebugBarriers::All) {
@@ -515,6 +606,9 @@ void Rasterizer::Finish() {
 }
 
 void Rasterizer::OnSubmit() {
+    if (DrawDiffEnabled()) {
+        draw_diff.EndFrame();
+    }
     buffer_cache.TickFrame();
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
