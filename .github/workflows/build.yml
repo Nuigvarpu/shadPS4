@@ -74,17 +74,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-26]
+        # Fork: only Windows is built and tested to keep CI fast.
+        os: [windows-latest]
         include:
           - os: windows-latest
             compiler_cxx: clang-cl
             compiler_c: clang-cl
-          - os: ubuntu-latest
-            compiler_cxx: clang++
-            compiler_c: clang
-          - os: macos-26
-            compiler_cxx: clang++
-            compiler_c: clang
 
     steps:
       - name: Checkout repository
@@ -187,6 +182,8 @@ jobs:
         path: ${{github.workspace}}/build/shadPS4.exe
 
   macos-sdl:
+    # Fork: only Windows builds are produced to keep CI fast.
+    if: false
     runs-on: macos-26
     needs: get-info
     steps:
@@ -247,6 +244,8 @@ jobs:
         path: upload/
 
   linux-sdl:
+    # Fork: only Windows builds are produced to keep CI fast.
+    if: false
     runs-on: ubuntu-24.04
     needs: get-info
     steps:
@@ -311,6 +310,8 @@ jobs:
         path: Shadps4-sdl.AppImage
 
   linux-sdl-gcc:
+    # Fork: only Windows builds are produced to keep CI fast.
+    if: false
     runs-on: ubuntu-24.04
     needs: get-info
     steps:
