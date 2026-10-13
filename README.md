@@ -69,12 +69,17 @@ El emulador lee el juego como una carpeta ya extraída. La estructura debe queda
 ```
 PS4Games\
 ├── CUSA00004\           ← el juego base (contiene eboot.bin, sce_sys\...)
-└── CUSA00004-UPDATE\    ← la actualización 1.07, extraída en una carpeta hermana
+└── CUSA00004-patch\     ← la actualización 1.07, extraída en una carpeta hermana
 ```
 
-- Saca el juego base de **tu** disco o consola.
-- Extrae el `.pkg` de **tu** actualización 1.07 (`...-A0107-V0100.pkg`) en una carpeta llamada exactamente `CUSA00004-UPDATE`, junto a `CUSA00004`. Para extraerlo hace falta una herramienta de extracción de PKG de PS4.
-- Aquí no se distribuyen el juego, la actualización ni las claves.
+La carpeta de la actualización puede llamarse `CUSA00004-patch` o `CUSA00004-UPDATE`; el emulador reconoce las dos.
+
+**Cómo extraer los `.pkg` con [PKGInstall](https://github.com/Muggle345/PKGInstall/releases/tag/Release)**, la herramienta que se usó en las pruebas. Es un proyecto de terceros, no incluido aquí:
+1. Descarga la versión para Windows desde su página de Releases y ábrela.
+2. En **PKG File**, elige el `.pkg` del juego base. En **Output Folder**, elige tu carpeta `PS4Games`. Pulsa **Extract**.
+3. Repite con el `.pkg` de **tu** actualización 1.07 (`...-A0107-V0100.pkg`), con la opción **Use separate update folder** marcada. Así se crea `CUSA00004-patch` junto al juego.
+
+Aquí no se distribuyen el juego, la actualización ni las claves.
 
 ### 2. Descomprime el paquete
 Descomprime el zip del Release en una carpeta donde tengas permiso de escritura. Por ejemplo, `Documentos\inFAMOUS-shadPS4`. No uses `Archivos de programa`.

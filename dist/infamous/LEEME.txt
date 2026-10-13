@@ -11,7 +11,11 @@ INSTALACION
    https://aka.ms/vs/17/release/vc_redist.x64.exe
 2. Organiza el juego asi (la actualizacion 1.07 extraida en una carpeta hermana):
      PS4Games\CUSA00004\
-     PS4Games\CUSA00004-UPDATE\
+     PS4Games\CUSA00004-patch\   (tambien vale CUSA00004-UPDATE)
+   Para extraer los .pkg se uso PKGInstall (herramienta de terceros, no incluida):
+     https://github.com/Muggle345/PKGInstall/releases/tag/Release
+   En PKGInstall: elige el .pkg, pon tu carpeta PS4Games como Output Folder y pulsa
+   Extract. Para la actualizacion 1.07 marca "Use separate update folder".
 3. Descomprime este zip en una carpeta donde puedas escribir (no en Archivos de programa).
 4. Ejecuta Configurar_primera_vez.bat (solo una vez, o de nuevo si mueves la carpeta).
 5. Abre shadPS4QtLauncher.exe, elige la carpeta PS4Games y juega.
