@@ -7,6 +7,7 @@
 #include "common/decoder.h"
 #include "common/signal_context.h"
 #include "core/cpu_patches.h" // Windows static guest red-zone protection
+#include "core/crash_report.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/threads/exception.h"
 #include "core/libraries/kernel/threads/pthread.h"
@@ -162,6 +163,19 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
                              ctx->R8, ctx->R9, ctx->R10, ctx->R11, ctx->R12, ctx->R13, ctx->R14,
                              ctx->R15, ctx->Rip);
             }
+        }
+        switch (code) {
+        case EXCEPTION_ACCESS_VIOLATION:
+        case EXCEPTION_ILLEGAL_INSTRUCTION:
+        case EXCEPTION_PRIV_INSTRUCTION:
+        case EXCEPTION_STACK_OVERFLOW:
+        case EXCEPTION_INT_DIVIDE_BY_ZERO:
+        case EXCEPTION_IN_PAGE_ERROR:
+            // Fatal for the emulator: save a crash report before shutting down.
+            CrashReport::Write("Excepcion no controlada en el emulador o en el juego", pExp);
+            break;
+        default:
+            break;
         }
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     }

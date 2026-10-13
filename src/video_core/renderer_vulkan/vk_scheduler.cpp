@@ -1,9 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <atomic>
-#include <chrono>
-
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -11,27 +8,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
-namespace AmdGpu {
-// Defined in liverpool.cpp.
-extern std::atomic<u64> g_gpu_wait_ns;
-extern std::atomic<u64> g_gpu_wait_count;
-extern std::atomic<u64> g_gpu_wait_cp_ns;
-extern std::atomic<u64> g_submit_ns;
-extern std::atomic<u64> g_submit_count;
-extern std::atomic<u64> g_finish_wait_ns;
-extern std::atomic<u64> g_finish_wait_count;
-extern thread_local bool g_is_command_processor_thread;
-} // namespace AmdGpu
-
 namespace Vulkan {
-
-namespace {
-u64 ElapsedNs(std::chrono::steady_clock::time_point start) {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
-                                                                start)
-        .count();
-}
-} // Anonymous namespace
 
 std::mutex Scheduler::submit_mutex;
 
@@ -142,10 +119,7 @@ void Scheduler::Finish() {
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
     SubmitExecution(info);
-    const auto start = std::chrono::steady_clock::now();
     Wait(presubmit_tick);
-    AmdGpu::g_finish_wait_ns.fetch_add(ElapsedNs(start), std::memory_order_relaxed);
-    AmdGpu::g_finish_wait_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 void Scheduler::Wait(u64 tick) {
@@ -154,14 +128,7 @@ void Scheduler::Wait(u64 tick) {
         SubmitInfo info{};
         Flush(info);
     }
-    const auto start = std::chrono::steady_clock::now();
     work_semaphore.Wait(tick);
-    const u64 waited = ElapsedNs(start);
-    AmdGpu::g_gpu_wait_ns.fetch_add(waited, std::memory_order_relaxed);
-    AmdGpu::g_gpu_wait_count.fetch_add(1, std::memory_order_relaxed);
-    if (AmdGpu::g_is_command_processor_thread) {
-        AmdGpu::g_gpu_wait_cp_ns.fetch_add(waited, std::memory_order_relaxed);
-    }
 }
 
 void Scheduler::PopPendingOperations() {
@@ -183,6 +150,7 @@ void Scheduler::BeginSession() {
     };
     session.primary = command_pool.Commit();
     Check(session.primary.begin(begin_info));
+    g_pipeline_bind_epoch.fetch_add(1, std::memory_order_relaxed);
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
@@ -216,13 +184,6 @@ void Scheduler::EndSession() {
 }
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
-    struct SubmitTimer {
-        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-        ~SubmitTimer() {
-            AmdGpu::g_submit_ns.fetch_add(ElapsedNs(start), std::memory_order_relaxed);
-            AmdGpu::g_submit_count.fetch_add(1, std::memory_order_relaxed);
-        }
-    } submit_timer;
     std::scoped_lock lk{submit_mutex};
     const u64 signal_value = work_semaphore.NextTick();
 

@@ -1,10 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <atomic>
-#include <chrono>
-#include <cstdlib>
-#include <string_view>
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
@@ -22,101 +18,7 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
-namespace VideoCore {
-// Experiment selected by the flicker lab, defined in texture_cache.cpp.
-extern std::atomic<u32> g_flicker_lab_mode;
-} // namespace VideoCore
-
 namespace AmdGpu {
-
-// Timing of GPU waits and queue submissions, filled in by the Vulkan scheduler and reported once
-// per second by the command processor thread.
-std::atomic<u64> g_gpu_wait_ns{};
-std::atomic<u64> g_gpu_wait_count{};
-std::atomic<u64> g_gpu_wait_cp_ns{};
-std::atomic<u64> g_submit_ns{};
-std::atomic<u64> g_submit_count{};
-std::atomic<u64> g_finish_wait_ns{};
-std::atomic<u64> g_finish_wait_count{};
-thread_local bool g_is_command_processor_thread = false;
-
-namespace {
-
-s64 NowNs() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
-
-/// Where the command processor thread spends its time, logged about once per second.
-struct CommandProcessorStats {
-    s64 window_start_ns = 0;
-    u64 idle_ns = 0;
-    u64 task_ns = 0;
-    u64 command_ns = 0;
-    u64 submit_ns = 0;
-    u64 resumes = 0;
-    u64 yields = 0;
-    u64 frames = 0;
-    u64 gds_finishes = 0;
-    u64 gds_finish_ns = 0;
-    u64 occlusion_dumps = 0;
-
-    void MaybeReport() {
-        const s64 now = NowNs();
-        if (window_start_ns == 0) {
-            window_start_ns = now;
-            return;
-        }
-        const s64 elapsed = now - window_start_ns;
-        if (elapsed < 1'000'000'000) {
-            return;
-        }
-        const auto ms = [](u64 ns) { return static_cast<double>(ns) / 1e6; };
-        LOG_INFO(Render,
-                 "GPU thread: {} frames, {:.1f} ms in command buffers ({} resumes, {} yielded), "
-                 "{:.1f} ms in queued commands, {:.1f} ms submitting frames, {:.1f} ms idle in "
-                 "{:.1f} s; GPU waits: {} ({:.1f} ms, {:.1f} ms on this thread), of which {} "
-                 "full finishes ({:.1f} ms) and {} GDS fence finishes ({:.1f} ms); queue "
-                 "submits: {} ({:.1f} ms); {} occlusion query dumps",
-                 frames, ms(task_ns), resumes, yields, ms(command_ns), ms(submit_ns), ms(idle_ns),
-                 static_cast<double>(elapsed) / 1e9, g_gpu_wait_count.exchange(0),
-                 ms(g_gpu_wait_ns.exchange(0)), ms(g_gpu_wait_cp_ns.exchange(0)),
-                 g_finish_wait_count.exchange(0), ms(g_finish_wait_ns.exchange(0)), gds_finishes,
-                 ms(gds_finish_ns), g_submit_count.exchange(0), ms(g_submit_ns.exchange(0)),
-                 occlusion_dumps);
-        *this = CommandProcessorStats{.window_start_ns = now};
-    }
-};
-CommandProcessorStats cp_stats;
-
-/// Debug switch: SHADPS4_SYNC_SUBMIT=1 makes every graphics submission synchronous: the
-/// submitting guest thread waits until the command processor has processed it and the GPU has
-/// executed it. Rules out timing-dependent differences caused by emulation latency.
-bool SynchronousSubmits() {
-    static const bool enabled = [] {
-        const char* env = std::getenv("SHADPS4_SYNC_SUBMIT");
-        const bool value = env != nullptr && std::string_view{env} == "1";
-        LOG_INFO(Render, "Synchronous submits: {}", value ? "enabled" : "disabled");
-        return value;
-    }();
-    return enabled || VideoCore::g_flicker_lab_mode.load(std::memory_order_relaxed) == 2;
-}
-
-/// Occlusion query results are not measured; every query reports a large visible pixel count.
-/// For debugging, SHADPS4_OCCLUSION_MODE=occluded makes every query report zero visible pixels
-/// instead, which shows which effects depend on occlusion queries.
-bool OcclusionQueriesReportOccluded() {
-    static const bool occluded = [] {
-        const char* env = std::getenv("SHADPS4_OCCLUSION_MODE");
-        const bool value = env != nullptr && std::string_view{env} == "occluded";
-        LOG_INFO(Render, "Occlusion queries report: {}", value ? "occluded" : "visible");
-        return value;
-    }();
-    return occluded;
-}
-
-} // Anonymous namespace
 
 static const char* dcb_task_name{"DCB_TASK"};
 static const char* ccb_task_name{"CCB_TASK"};
@@ -189,19 +91,19 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+    // This thread records every draw and limits the frame rate, keep it on a fast core.
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::VeryHigh);
+    Common::SetCurrentThreadPerformanceCores();
     gpu_id = std::this_thread::get_id();
-    g_is_command_processor_thread = true;
 #ifdef __linux__
     gpu_tid = gettid();
 #endif
 
     while (!stoken.stop_requested()) {
         {
-            const s64 idle_start = NowNs();
             std::unique_lock lk{submit_mutex};
             Common::CondvarWait(submit_cv, lk, stoken,
                                 [this] { return num_commands || num_submits || submit_done; });
-            cp_stats.idle_ns += NowNs() - idle_start;
         }
         if (stoken.stop_requested()) {
             break;
@@ -212,9 +114,7 @@ void Liverpool::Process(std::stop_token stoken) {
         curr_qid = -1;
 
         while (num_submits || num_commands) {
-            const s64 command_start = NowNs();
             ProcessCommands();
-            cp_stats.command_ns += NowNs() - command_start;
 
             curr_qid = (curr_qid + 1) % num_mapped_queues;
 
@@ -228,17 +128,10 @@ void Liverpool::Process(std::stop_token stoken) {
                 }
                 task = queue.submits.front();
             }
-            const s64 task_start = NowNs();
             task.resume();
-            cp_stats.task_ns += NowNs() - task_start;
-            ++cp_stats.resumes;
-            cp_stats.yields += task.done() ? 0 : 1;
 
             if (task.done()) {
                 task.destroy();
-                if (SynchronousSubmits() && rasterizer) {
-                    rasterizer->Finish();
-                }
 
                 std::scoped_lock lock{queue.m_access};
                 queue.submits.pop();
@@ -250,17 +143,13 @@ void Liverpool::Process(std::stop_token stoken) {
         }
 
         if (submit_done) {
-            const s64 submit_start = NowNs();
             VideoCore::EndCapture();
             if (rasterizer) {
                 rasterizer->OnSubmit();
                 rasterizer->Flush();
             }
             submit_done = false;
-            cp_stats.submit_ns += NowNs() - submit_start;
-            ++cp_stats.frames;
         }
-        cp_stats.MaybeReport();
 
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }
@@ -766,10 +655,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
                             *results = pixel_counter | OcclusionCounterValidMask;
                         }
-                        if (!OcclusionQueriesReportOccluded()) {
-                            pixel_counter += OcclusionCounterStep;
-                        }
-                        ++cp_stats.occlusion_dumps;
+                        pixel_counter += OcclusionCounterStep;
                     }
                 }
                 break;
@@ -786,10 +672,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
                     ASSERT(event_eos->size == 1);
                     if (rasterizer) {
-                        const s64 finish_start = NowNs();
                         rasterizer->Finish();
-                        cp_stats.gds_finish_ns += NowNs() - finish_start;
-                        ++cp_stats.gds_finishes;
                         const u32 value = rasterizer->ReadDataFromGds(event_eos->gds_index);
                         *event_eos->Address() = value;
                     }
@@ -1276,14 +1159,9 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
         queue.submits.emplace(task.handle);
     }
 
-    {
-        std::scoped_lock lk{submit_mutex};
-        ++num_submits;
-        submit_cv.notify_one();
-    }
-    if (SynchronousSubmits()) {
-        WaitGpuIdle();
-    }
+    std::scoped_lock lk{submit_mutex};
+    ++num_submits;
+    submit_cv.notify_one();
 }
 
 void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {

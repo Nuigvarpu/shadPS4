@@ -13,6 +13,11 @@
 
 namespace Storage {
 
+/// Version of the cached shader binaries. It is part of the cache file name, so a build that
+/// changes how shaders are compiled starts a fresh cache instead of mixing generations (mixed
+/// caches load pipelines with the wrong shader permutations).
+constexpr u32 CacheFormatVersion = 10;
+
 enum class BlobType : u32 {
     ShaderMeta,
     ShaderBinary,

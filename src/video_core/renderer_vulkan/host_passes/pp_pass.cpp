@@ -9,6 +9,7 @@
 #include "video_core/host_shaders/post_process_frag.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 #include <boost/container/static_vector.hpp>
@@ -232,6 +233,7 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
     };
 
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+    Vulkan::g_pipeline_bind_epoch.fetch_add(1, std::memory_order_relaxed);
 
     const std::array viewports = {
         vk::Viewport{

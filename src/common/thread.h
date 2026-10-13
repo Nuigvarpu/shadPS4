@@ -22,6 +22,9 @@ void SetCurrentThreadRealtime(std::chrono::nanoseconds period_ns);
 
 void SetCurrentThreadPriority(ThreadPriority new_priority);
 
+/// On hybrid CPUs keeps the calling thread on performance cores. Returns false if not applied.
+bool SetCurrentThreadPerformanceCores();
+
 void SetCurrentThreadName(const char* name);
 
 void SetThreadName(void* thread, const char* name);

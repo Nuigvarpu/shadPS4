@@ -148,6 +148,7 @@ void FaultManager::ProcessFaultBuffer() {
         .pBufferMemoryBarriers = &pre_barrier,
     });
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *fault_process_pipeline);
+    Vulkan::g_pipeline_bind_epoch.fetch_add(1, std::memory_order_relaxed);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *fault_process_pipeline_layout, 0,
                                 writes);
     // 1 bit per page, 32 pages per workgroup

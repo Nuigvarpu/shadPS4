@@ -1,0 +1,21 @@
+{
+  "General": {
+    "extra_dmem_in_mbytes": 5,
+    "redzone_patches": true
+  },
+  "GPU": {
+    "copy_gpu_buffers": true,
+    "readbacks_mode": 2,
+    "readback_linear_images_enabled": false,
+    "direct_memory_access_enabled": false,
+    "vblank_frequency": 60,
+    "fps_limit": 30
+  },
+  "Input": {
+    "motion_controls_enabled": true
+  },
+  "Vulkan": {
+    "pipeline_cache_enabled": true,
+    "pipeline_cache_archived": true
+  }
+}

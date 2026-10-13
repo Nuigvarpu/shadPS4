@@ -146,6 +146,14 @@ public:
         UniqueImage image;
         State state;
         std::vector<State> subresource_states;
+        /// Last partial transition, to skip re-checking every subresource when the same view is
+        /// bound again for reading.
+        struct PartialTransition {
+            SubresourceRange range;
+            vk::ImageLayout layout;
+            vk::AccessFlags2 access_mask;
+        };
+        std::optional<PartialTransition> last_partial;
         SmallVector<ImageViewInfo, 2> image_view_infos;
         SmallVector<ImageViewId, 2> image_view_ids;
         u32 num_samples;

@@ -135,6 +135,7 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Shader::Optimization::SsaRepairPass(program);
     Shader::Optimization::SsaRewritePass(program);
     Shader::Optimization::SharedMemoryBarrierPass(program, runtime_info, profile);
+    Shader::Optimization::WaveGlobalMemorySyncPass(program, runtime_info, profile);
     Shader::Optimization::DeadCodeEliminationPass(program);
     Shader::Optimization::LowerWave64BallotPass(program, runtime_info, profile);
     Shader::Optimization::LowerHardwareIntrinsics(program);

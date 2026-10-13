@@ -1,8 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <string>
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/elf_info.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -233,7 +238,52 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
     return 0;
 }
 
+namespace {
+/// Frame rate cap, from the "fps_limit" GPU setting (global or per game). A steady cap below what
+/// the emulator can reach keeps the frame pacing even instead of swinging with the scene.
+/// The SHADPS4_FPS_CAP environment variable overrides the setting.
+u32 FrameRateCap() {
+    static const u32 cap = [] {
+        s64 value = EmulatorSettings.GetFpsLimit();
+        if (const char* env = std::getenv("SHADPS4_FPS_CAP"); env != nullptr && *env != '\0') {
+            value = std::strtol(env, nullptr, 10);
+        }
+        if (value < 0) {
+            // Automatic: games whose frame pacing is known to be uneven above 30 fps.
+            // The game is loaded before its first flip, so its serial is known here.
+            value = Common::ElfInfo::Instance().GameSerial() == "CUSA00004" ? 30 : 0;
+        }
+        const u32 result = static_cast<u32>(std::clamp<s64>(value, 0, 1000));
+        LOG_INFO(Lib_VideoOut, "Frame rate cap: {}",
+                 result != 0 ? std::to_string(result) : std::string{"off"});
+        return result;
+    }();
+    return cap;
+}
+
+void WaitForFrameRateCap() {
+    const u32 cap = FrameRateCap();
+    if (cap == 0) {
+        return;
+    }
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point next_frame{};
+    const auto period = std::chrono::nanoseconds(1'000'000'000 / cap);
+    auto now = Clock::now();
+    if (next_frame != Clock::time_point{} && now < next_frame) {
+        Common::AccurateSleep(next_frame - now, nullptr, false);
+        now = Clock::now();
+    }
+    // Keep a steady cadence, but do not try to catch up after a slow frame.
+    next_frame = (next_frame == Clock::time_point{} || now - next_frame > period)
+                     ? now + period
+                     : next_frame + period;
+}
+} // Anonymous namespace
+
 void VideoOutDriver::Flip(const Request& req) {
+    WaitForFrameRateCap();
+
     // Update HDR status before presenting.
     presenter->SetHDR(req.port->is_hdr);
 

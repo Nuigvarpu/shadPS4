@@ -3,9 +3,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <ctime>
 #include <string>
 #include <thread>
+#include <vector>
 #include <fmt/format.h>
 
 #include "core/libraries/fiber/fiber.h"
@@ -84,6 +86,58 @@ void SetCurrentThreadRealtime(const std::chrono::nanoseconds period_ns) {
 
 #ifdef _WIN32
 
+bool SetCurrentThreadPerformanceCores() {
+    // On hybrid CPUs (P-cores and E-cores) Windows may move a busy thread to an efficiency core,
+    // e.g. after the window loses focus. CPU sets with the highest efficiency class are the
+    // performance cores.
+    ULONG length = 0;
+    GetSystemCpuSetInformation(nullptr, 0, &length, GetCurrentProcess(), 0);
+    if (length == 0) {
+        return false;
+    }
+    std::vector<u8> buffer(length);
+    if (!GetSystemCpuSetInformation(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data()),
+                                    length, &length, GetCurrentProcess(), 0)) {
+        return false;
+    }
+    std::vector<ULONG> performance_sets;
+    u8 min_class = 0xFF;
+    u8 max_class = 0;
+    for (ULONG offset = 0; offset < length;) {
+        const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(&buffer[offset]);
+        if (info->Size == 0) {
+            break;
+        }
+        if (info->Type == CpuSetInformation) {
+            min_class = std::min(min_class, info->CpuSet.EfficiencyClass);
+            max_class = std::max(max_class, info->CpuSet.EfficiencyClass);
+        }
+        offset += info->Size;
+    }
+    if (min_class == max_class) {
+        // Not a hybrid CPU: nothing to prefer.
+        return false;
+    }
+    for (ULONG offset = 0; offset < length;) {
+        const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(&buffer[offset]);
+        if (info->Size == 0) {
+            break;
+        }
+        if (info->Type == CpuSetInformation && info->CpuSet.EfficiencyClass == max_class) {
+            performance_sets.push_back(info->CpuSet.Id);
+        }
+        offset += info->Size;
+    }
+    if (performance_sets.empty()) {
+        return false;
+    }
+    const bool ok = SetThreadSelectedCpuSets(GetCurrentThread(), performance_sets.data(),
+                                             static_cast<ULONG>(performance_sets.size()));
+    LOG_INFO(Common, "Thread restricted to {} performance logical processors: {}",
+             performance_sets.size(), ok ? "ok" : "failed");
+    return ok;
+}
+
 void SetCurrentThreadPriority(ThreadPriority new_priority) {
     auto handle = GetCurrentThread();
     int windows_priority = 0;
@@ -131,6 +185,10 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
 }
 
 #else
+
+bool SetCurrentThreadPerformanceCores() {
+    return false;
+}
 
 void SetCurrentThreadPriority(ThreadPriority new_priority) {
     pthread_t this_thread = pthread_self();

@@ -6,6 +6,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <vector>
 #include <CLI/CLI.hpp>
 #include <SDL3/SDL_messagebox.h>
@@ -17,6 +18,7 @@
 #include "common/logging/log.h"
 #include "common/memory_patcher.h"
 #include "common/path_util.h"
+#include "core/crash_report.h"
 #include "core/debugger.h"
 #include "core/emulator_settings.h"
 #include "core/emulator_state.h"
@@ -34,6 +36,10 @@
 
 int main(int argc, char* argv[]) {
 #ifdef _WIN32
+    // Helper process started by the crash handler of a crashed emulator to write its minidump.
+    if (argc > 1 && std::string_view{argv[1]} == Core::CrashReport::DumpWriterSwitch) {
+        return Core::CrashReport::RunDumpWriter();
+    }
     SetConsoleOutputCP(CP_UTF8);
 #endif
 
@@ -150,6 +156,8 @@ int main(int argc, char* argv[]) {
 
     // Initialize main log with default config
     Common::Log::Setup("shadps4.log");
+    // Write a crash report (text, minidump and a copy of the log) to the log folder on a crash.
+    Core::CrashReport::Install();
 
     LOG_INFO(Debug, "Run: {}", fmt::join(std::span(argv, argc), " "));
 

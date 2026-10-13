@@ -709,11 +709,24 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite |
         vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
 
-    if (src_access & WRITE_MASK) {
+    // The same buffers are bound by draw after draw, so most ranges are already recorded and
+    // a lookup is much cheaper than an insert.
+    if ((src_access & WRITE_MASK) && !resource->write_ranges.Contains(range.start, range.end)) {
         resource->write_ranges.Add(range);
     }
-    if (src_access & READ_MASK) {
+    if ((src_access & READ_MASK) && !resource->read_ranges.Contains(range.start, range.end)) {
         resource->read_ranges.Add(range);
+        // Thousands of scattered read ranges make every insert shift a large array. They only
+        // decide whether a later write needs a barrier, so collapsing them into one bounding
+        // range is safe (at worst it adds a barrier).
+        if (resource->read_ranges.Size() > 64) {
+            const Interval bounds = {
+                .start = resource->read_ranges.begin()->start,
+                .end = std::prev(resource->read_ranges.end())->end,
+            };
+            resource->read_ranges.Clear();
+            resource->read_ranges.Add(bounds);
+        }
     }
 
     memory_barrier.srcStageMask |= src_stage;

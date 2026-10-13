@@ -1,12 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <atomic>
-#include <chrono>
-#include <cstdlib>
+#include <cstring>
 #include <optional>
-#include <string_view>
-#include <unordered_map>
 #include <unordered_set>
 
 #include "common/debug.h"
@@ -28,128 +24,23 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 
-namespace VideoCore {
-// Experiment selected by the flicker lab, defined in texture_cache.cpp.
-extern std::atomic<u32> g_flicker_lab_mode;
-} // namespace VideoCore
-
 namespace Vulkan {
 
 namespace {
 
-/// Debug switch to rule out missing synchronization: SHADPS4_DEBUG_BARRIERS=compute inserts a
-/// full memory barrier around every compute dispatch, =all also after every draw.
-enum class DebugBarriers { None, Compute, All };
-
-DebugBarriers DebugBarrierMode() {
-    if (VideoCore::g_flicker_lab_mode.load(std::memory_order_relaxed) == 5) {
-        return DebugBarriers::All;
-    }
-    static const DebugBarriers mode = [] {
-        const char* env = std::getenv("SHADPS4_DEBUG_BARRIERS");
-        const std::string_view value = env ? env : "";
-        const DebugBarriers result = value == "all"       ? DebugBarriers::All
-                                     : value == "compute" ? DebugBarriers::Compute
-                                                          : DebugBarriers::None;
-        LOG_INFO(Render_Vulkan, "Debug barriers: {}",
-                 result == DebugBarriers::All       ? "all"
-                 : result == DebugBarriers::Compute ? "compute"
-                                                    : "off");
-        return result;
-    }();
-    return mode;
+/// inFAMOUS Second Son merge-sorts its particles back to front with compute shader 0xa16fa93a.
+/// Every pass reads what the previous pass wrote, so the passes are kept strictly ordered with a
+/// compute-to-compute barrier.
+bool IsParticleSort(u64 hash) {
+    return hash == 0xa16fa93aULL;
 }
 
-/// Debug switch: SHADPS4_DRAW_DIFF=1 logs, for every guest submission, the pipelines whose number
-/// of draws or drawn elements changed compared to the previous submission. On a static scene this
-/// shows whether an object that flickers is drawn only every other frame (decided on the CPU) or
-/// drawn every frame with different data (decided on the GPU).
-bool DrawDiffEnabled() {
-    static const bool enabled = [] {
-        const char* env = std::getenv("SHADPS4_DRAW_DIFF");
-        const bool value = env != nullptr && std::string_view{env} == "1";
-        LOG_INFO(Render_Vulkan, "Draw diff: {}", value ? "enabled" : "disabled");
-        return value;
-    }();
-    return enabled;
-}
-
-struct DrawDiffTracker {
-    struct Entry {
-        u64 vs{};
-        u64 ps{};
-        u32 draws{};
-        u32 indirect{};
-        u64 elements{};
-    };
-    std::unordered_map<u64, Entry> current;
-    std::unordered_map<u64, Entry> previous;
-    u64 frame{};
-    u64 lines{};
-
-    void Note(const GraphicsPipeline* pipeline, u64 elements, bool indirect) {
-        const auto stages = pipeline->GetStages();
-        const auto* vs = stages[static_cast<u32>(Shader::SwStage::Vertex)];
-        const auto* ps = stages[static_cast<u32>(Shader::SwStage::Fragment)];
-        const u64 vs_hash = vs ? vs->pgm_hash : 0;
-        const u64 ps_hash = ps ? ps->pgm_hash : 0;
-        auto& entry = current[vs_hash * 0x9E3779B97F4A7C15ULL ^ ps_hash];
-        entry.vs = vs_hash;
-        entry.ps = ps_hash;
-        ++entry.draws;
-        entry.indirect += indirect ? 1 : 0;
-        entry.elements += elements;
-    }
-
-    void EndFrame() {
-        u32 total_draws = 0;
-        for (const auto& [key, entry] : current) {
-            total_draws += entry.draws;
-        }
-        u32 changed = 0;
-        const auto report = [&](const Entry& now, const Entry& before) {
-            if (now.draws == before.draws && now.elements == before.elements) {
-                return;
-            }
-            ++changed;
-            if (lines < 40000) {
-                ++lines;
-                LOG_INFO(Render_Vulkan,
-                         "Draw diff: frame {} vs={:#x} ps={:#x} draws {} -> {} ({} indirect), "
-                         "elements {} -> {}",
-                         frame, now.vs | before.vs, now.ps | before.ps, before.draws, now.draws,
-                         now.indirect | before.indirect, before.elements, now.elements);
-            }
-        };
-        for (const auto& [key, entry] : current) {
-            const auto it = previous.find(key);
-            report(entry, it != previous.end() ? it->second : Entry{});
-        }
-        for (const auto& [key, entry] : previous) {
-            if (!current.contains(key)) {
-                report(Entry{}, entry);
-            }
-        }
-        if (lines < 40000) {
-            ++lines;
-            LOG_INFO(Render_Vulkan,
-                     "Draw diff: frame {} done, {} draws in {} pipelines, {} changed", frame,
-                     total_draws, current.size(), changed);
-        }
-        previous.swap(current);
-        current.clear();
-        ++frame;
-    }
-};
-DrawDiffTracker draw_diff;
-
-void FullMemoryBarrier(Scheduler& scheduler) {
-    scheduler.EndRendering();
+void ComputeToComputeBarrier(Scheduler& scheduler) {
     const vk::MemoryBarrier2 barrier = {
-        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
     };
     scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
         .memoryBarrierCount = 1,
@@ -157,42 +48,16 @@ void FullMemoryBarrier(Scheduler& scheduler) {
     });
 }
 
-/// Counts passes the rasterizer handles specially instead of drawing, logged once per second.
-struct SpecialPassStats {
-    std::atomic<u64> fast_clear_eliminations{};
-    std::atomic<u64> fmask_decompressions{};
-    std::atomic<u64> resolves{};
-    std::atomic<u64> no_primitive_draws{};
-    std::atomic<u64> depth_stencil_copies{};
-    std::atomic<u64> hle_dispatches{};
-    std::atomic<u64> draws{};
-    std::atomic<u64> dispatches{};
-    std::atomic<s64> window_start_ns{};
-
-    void MaybeReport() {
-        const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now().time_since_epoch())
-                            .count();
-        s64 start = window_start_ns.load(std::memory_order_relaxed);
-        if (start == 0) {
-            window_start_ns.store(now, std::memory_order_relaxed);
-            return;
-        }
-        if (now - start < 1'000'000'000) {
-            return;
-        }
-        window_start_ns.store(now, std::memory_order_relaxed);
-        LOG_INFO(Render_Vulkan,
-                 "Passes: {} draws, {} dispatches, {} fast clear eliminations, {} skipped FMask "
-                 "decompressions, {} resolves, {} draws without primitives, {} depth-stencil "
-                 "copies, {} HLE dispatches",
-                 draws.exchange(0), dispatches.exchange(0), fast_clear_eliminations.exchange(0),
-                 fmask_decompressions.exchange(0), resolves.exchange(0),
-                 no_primitive_draws.exchange(0), depth_stencil_copies.exchange(0),
-                 hle_dispatches.exchange(0));
+/// The same sort is sized from a particle count the CPU read back from an earlier frame. Under
+/// emulation that count lags behind, so the newest particles would stay unsorted and blend in the
+/// wrong order. The shader bounds itself with the current count stored on the GPU, so launching
+/// extra workgroups is harmless.
+u32 AdjustDispatchX(u64 hash, u32 dim_x) {
+    if (IsParticleSort(hash)) {
+        return std::max<u32>(dim_x, 512);
     }
-};
-SpecialPassStats special_pass_stats;
+    return dim_x;
+}
 
 } // Anonymous namespace
 
@@ -229,32 +94,39 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
 
 Rasterizer::~Rasterizer() = default;
 
+void Rasterizer::BindPipeline(vk::CommandBuffer cmdbuf, vk::PipelineBindPoint bind_point,
+                              vk::Pipeline pipeline) {
+    // Consecutive draws often use the same pipeline; binding it again costs driver time.
+    auto& bound = bound_pipelines[bind_point == vk::PipelineBindPoint::eCompute ? 1 : 0];
+    const u64 epoch = g_pipeline_bind_epoch.load(std::memory_order_relaxed);
+    if (bound.cmdbuf == cmdbuf && bound.pipeline == pipeline && bound.epoch == epoch) {
+        return;
+    }
+    cmdbuf.bindPipeline(bind_point, pipeline);
+    bound = {.cmdbuf = cmdbuf, .pipeline = pipeline, .epoch = epoch};
+}
+
 bool Rasterizer::FilterDraw() {
     const auto& regs = liverpool->regs;
-    special_pass_stats.MaybeReport();
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::EliminateFastClear) {
         // Clears the render target if FCE is launched before any draws
-        ++special_pass_stats.fast_clear_eliminations;
         EliminateFastClear();
         return false;
     }
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::FmaskDecompress) {
         // TODO: check for a valid MRT1 to promote the draw to the resolve pass.
         LOG_TRACE(Render_Vulkan, "FMask decompression pass skipped");
-        ++special_pass_stats.fmask_decompressions;
         ScopedMarkerInsert("FmaskDecompress");
         EliminateFastClear();
         return false;
     }
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Resolve) {
         LOG_TRACE(Render_Vulkan, "Resolve pass");
-        ++special_pass_stats.resolves;
         Resolve();
         return false;
     }
     if (regs.primitive_type == AmdGpu::PrimitiveType::None) {
         LOG_TRACE(Render_Vulkan, "Primitive type 'None' skipped");
-        ++special_pass_stats.no_primitive_draws;
         ScopedMarkerInsert("PrimitiveTypeNone");
         return false;
     }
@@ -275,7 +147,6 @@ bool Rasterizer::FilterDraw() {
         // do a copy from one depth-stencil surface to another, without a pixel shader.
         // We need to detect this case and perform the copy, otherwise it will have no effect.
         LOG_TRACE(Render_Vulkan, "Performing depth-stencil override copy");
-        ++special_pass_stats.depth_stencil_copies;
         DepthStencilCopy(depth_copy, stencil_copy);
         return false;
     }
@@ -400,7 +271,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    BindPipeline(cmdbuf, vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
     if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
@@ -409,15 +280,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
                     instance_offset);
     }
-    if (DrawDiffEnabled()) {
-        draw_diff.Note(pipeline, u64(regs.num_indices) * u64(regs.num_instances.NumInstances()),
-                       false);
-    }
     DebugState.IncDrawCall();
-    ++special_pass_stats.draws;
-    if (DebugBarrierMode() == DebugBarriers::All) {
-        FullMemoryBarrier(scheduler);
-    }
 
     ResetBindings(false);
 }
@@ -476,7 +339,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     scheduler.BeginRendering(state);
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    BindPipeline(cmdbuf, vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
     if (is_indexed) {
         ASSERT(sizeof(VkDrawIndexedIndirectCommand) == stride);
@@ -499,13 +362,6 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         }
         DebugState.IncDrawCall();
     }
-    if (DrawDiffEnabled()) {
-        draw_diff.Note(pipeline, 0, true);
-    }
-    ++special_pass_stats.draws;
-    if (DebugBarrierMode() == DebugBarriers::All) {
-        FullMemoryBarrier(scheduler);
-    }
 
     ResetBindings(false);
 }
@@ -523,7 +379,6 @@ void Rasterizer::DispatchDirect() {
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
-        ++special_pass_stats.hle_dispatches;
         return;
     }
 
@@ -536,19 +391,16 @@ void Rasterizer::DispatchDirect() {
     }
 
     scheduler.EndRendering();
-    if (DebugBarrierMode() != DebugBarriers::None) {
-        FullMemoryBarrier(scheduler);
+    if (IsParticleSort(cs.pgm_hash)) {
+        ComputeToComputeBarrier(scheduler);
     }
     pipeline->BindResources(set_writes, push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
-    cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    BindPipeline(cmdbuf, vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    cmdbuf.dispatch(AdjustDispatchX(cs.pgm_hash, cs_program.dim_x), cs_program.dim_y,
+                    cs_program.dim_z);
     DebugState.IncDispatch();
-    ++special_pass_stats.dispatches;
-    if (DebugBarrierMode() != DebugBarriers::None) {
-        FullMemoryBarrier(scheduler);
-    }
 
     ResetBindings(true);
 }
@@ -577,19 +429,12 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     }
 
     scheduler.EndRendering();
-    if (DebugBarrierMode() != DebugBarriers::None) {
-        FullMemoryBarrier(scheduler);
-    }
     pipeline->BindResources(set_writes, push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    BindPipeline(cmdbuf, vk::PipelineBindPoint::eCompute, pipeline->Handle());
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
     DebugState.IncDispatch();
-    ++special_pass_stats.dispatches;
-    if (DebugBarrierMode() != DebugBarriers::None) {
-        FullMemoryBarrier(scheduler);
-    }
 
     ResetBindings(true);
 }
@@ -606,9 +451,6 @@ void Rasterizer::Finish() {
 }
 
 void Rasterizer::OnSubmit() {
-    if (DrawDiffEnabled()) {
-        draw_diff.EndFrame();
-    }
     buffer_cache.TickFrame();
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
@@ -745,6 +587,22 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
 
     const auto cmdbuf = scheduler.CommandBuffer();
     const auto num_buffers = guest_buffers.size();
+    {
+        // Skip binding the same vertex buffers as the previous draw.
+        const u64 epoch = g_pipeline_bind_epoch.load(std::memory_order_relaxed);
+        auto& bound = bound_vertex_buffers;
+        if (bound.cmdbuf == cmdbuf && bound.epoch == epoch && bound.buffers == host_buffers &&
+            bound.offsets == host_offsets && bound.sizes == host_sizes &&
+            bound.strides == host_strides) {
+            return;
+        }
+        bound.cmdbuf = cmdbuf;
+        bound.epoch = epoch;
+        bound.buffers = host_buffers;
+        bound.offsets = host_offsets;
+        bound.sizes = host_sizes;
+        bound.strides = host_strides;
+    }
     if (instance.IsVertexInputDynamicState()) {
         cmdbuf.bindVertexBuffers(0, num_buffers, host_buffers.data(), host_offsets.data());
     } else {
@@ -789,6 +647,22 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
     }
 
     const auto cmdbuf = scheduler.CommandBuffer();
+    {
+        // Skip binding the same index buffer as the previous draw.
+        const u64 epoch = g_pipeline_bind_epoch.load(std::memory_order_relaxed);
+        auto& bound = bound_index_buffer;
+        if (bound.cmdbuf == cmdbuf && bound.epoch == epoch && bound.buffer == index_buffer &&
+            bound.offset == buffer_offset && bound.size == index_buffer_size &&
+            bound.type == index_type) {
+            return;
+        }
+        bound = {.cmdbuf = cmdbuf,
+                 .epoch = epoch,
+                 .buffer = index_buffer,
+                 .offset = buffer_offset,
+                 .size = index_buffer_size,
+                 .type = index_type};
+    }
     if (instance.IsMaintenance5Supported()) {
         cmdbuf.bindIndexBuffer2KHR(index_buffer, buffer_offset, index_buffer_size, index_type);
     } else {
@@ -1095,7 +969,19 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
         for (auto i = 0; i < num_bindings; i++) {
             auto& [image_id, desc] = image_bindings[num_images++];
-            std::construct_at(&desc, tsharp, image_desc);
+            TextureDescKey key{.flags = u32(image_desc.is_depth) | u32(image_desc.is_written) << 1 |
+                                        u32(image_desc.is_array) << 2};
+            static_assert(sizeof(tsharp) == sizeof(key.sharp));
+            std::memcpy(key.sharp.data(), &tsharp, sizeof(key.sharp));
+            if (const auto it = texture_desc_cache.find(key); it != texture_desc_cache.end()) {
+                std::construct_at(&desc, it->second);
+            } else {
+                std::construct_at(&desc, tsharp, image_desc);
+                if (texture_desc_cache.size() >= 16384) {
+                    texture_desc_cache.clear();
+                }
+                texture_desc_cache.emplace(key, desc);
+            }
 
             if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
                 ASSERT(num_bindings == 1);
@@ -1476,6 +1362,21 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     return true;
 }
 
+namespace {
+/// A guest writing through memory sequentially would take one fault per 4 KB page. On a write
+/// fault, the clean buffer pages of the surrounding 64 KB window are unprotected at once.
+constexpr u64 FaultWindowSize = 64_KB;
+} // Anonymous namespace
+
+void Rasterizer::ExpandWriteFault(VAddr addr) {
+    constexpr u64 window = FaultWindowSize;
+    const VAddr start = addr & ~(window - 1);
+    if (!IsMapped(start, window)) {
+        return;
+    }
+    buffer_cache.InvalidateFaultWindow(start, window);
+}
+
 bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
@@ -1752,7 +1653,7 @@ StencilFace ResolveStencilFace(AmdGpu::CompareFunc func, AmdGpu::StencilFunc fai
                     (static_cast<u64>(ref.stencil_op_val) << 40);
     const bool exact = fail_op && pass_op && zfail_op;
     if (seen.insert(key).second) {
-        LOG_INFO(Render_Vulkan,
+        LOG_DEBUG(Render_Vulkan,
                  "Stencil test/op value conflict: func={} fail={} zpass={} zfail={} test_val={:#x} "
                  "mask={:#x} write_mask={:#x} op_val={:#x} -> {}",
                  static_cast<u32>(func), static_cast<u32>(fail), static_cast<u32>(zpass),

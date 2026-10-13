@@ -177,6 +177,15 @@ void Flush() {
     }
 }
 
+std::filesystem::path CurrentLogFile() {
+    if (g_shad_file_sink == nullptr) {
+        return {};
+    }
+    const std::filesystem::path session{g_shad_file_sink->session_file_helper_.filename()};
+    return session.empty() ? std::filesystem::path{g_shad_file_sink->main_file_helper_.filename()}
+                           : session;
+}
+
 void UpdateSinks() {
     std::initializer_list<spdlog::sink_ptr> sinks{g_console_sink, g_shad_file_sink};
 

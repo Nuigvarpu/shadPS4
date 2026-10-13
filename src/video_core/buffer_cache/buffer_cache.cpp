@@ -3,14 +3,9 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
-#include <cstdlib>
 #include <memory>
 #include <mutex>
-#include <string>
-#include <string_view>
-#include <unordered_map>
 #include <vector>
 #include <magic_enum/magic_enum.hpp>
 
@@ -31,13 +26,6 @@
 #include <vk_mem_alloc.h>
 
 namespace VideoCore {
-
-// Texture cache statistics, defined in texture_cache.cpp.
-void TextureCacheNoteTexelSync();
-void TextureCacheNoteBufferRead(bool synced);
-void TextureCacheNoteBufferOverlapRead();
-// Experiment selected by the flicker lab, defined in texture_cache.cpp.
-extern std::atomic<u32> g_flicker_lab_mode;
 
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
 static constexpr size_t NULL_INDEX_BUFFER_SIZE = 16;
@@ -124,131 +112,21 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
     });
 }
 
+void BufferCache::InvalidateFaultWindow(VAddr device_addr, u64 size) {
+    memory_tracker->MarkCleanPagesAsCpuModified(device_addr, size);
+}
+
 namespace {
 
-/// Size of the window downloaded around a CPU read of GPU-modified memory. Larger windows mean
-/// fewer GPU synchronizations when the guest reads many nearby addresses, at the cost of copying
-/// more data per fault. Can be tuned with SHADPS4_READBACK_WINDOW_KB (power of two, 64..65536).
-u64 ReadbackWindowSize() {
-    static const u64 window = []() -> u64 {
-        constexpr u64 Default = 512_KB;
-        const char* env = std::getenv("SHADPS4_READBACK_WINDOW_KB");
-        if (env == nullptr) {
-            return Default;
-        }
-        const u64 kb = std::strtoull(env, nullptr, 10);
-        if (kb < 64 || kb > 65536 || (kb & (kb - 1)) != 0) {
-            LOG_WARNING(Render, "Ignoring invalid SHADPS4_READBACK_WINDOW_KB={}", env);
-            return Default;
-        }
-        LOG_INFO(Render, "Readback window size: {} KB", kb);
-        return kb * 1_KB;
-    }();
-    return window;
+s64 NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
 }
 
-/// Statistics about guest-triggered GPU readbacks, logged about once per second, to find out
-/// where synchronization time goes and which memory the guest keeps reading back.
-struct ReadbackStats {
-    struct Region {
-        u32 reads;
-        u32 writes;
-    };
-
-    std::mutex mutex;
-    u64 faults{};
-    u64 write_faults{};
-    u64 gpu_thread_faults{};
-    u64 empty_faults{};
-    u64 queue_ns{};
-    u64 flush_ns{};
-    s64 window_start_ns{};
-    std::unordered_map<VAddr, Region> regions;
-    std::atomic<u64> downloads{};
-    std::atomic<u64> ranges{};
-    std::atomic<u64> bytes{};
-    std::atomic<u64> skipped{};
-    std::atomic<u64> prefetches{};
-    std::atomic<u64> async_jobs{};
-    std::atomic<u64> async_wait_ns{};
-
-    static s64 Now() {
-        return std::chrono::duration_cast<std::chrono::nanoseconds>(
-                   std::chrono::steady_clock::now().time_since_epoch())
-            .count();
-    }
-
-    void Report(VAddr addr, bool is_write, bool gpu_thread, bool downloaded, u64 waited_queue_ns,
-                u64 waited_flush_ns) {
-        std::scoped_lock lk{mutex};
-        ++faults;
-        write_faults += is_write ? 1 : 0;
-        gpu_thread_faults += gpu_thread ? 1 : 0;
-        empty_faults += downloaded ? 0 : 1;
-        queue_ns += waited_queue_ns;
-        flush_ns += waited_flush_ns;
-        auto& region = regions[addr >> 16];
-        ++(is_write ? region.writes : region.reads);
-
-        const s64 now = Now();
-        if (window_start_ns == 0) {
-            window_start_ns = now;
-            return;
-        }
-        const s64 elapsed = now - window_start_ns;
-        if (elapsed < 1'000'000'000) {
-            return;
-        }
-        std::vector<std::pair<VAddr, Region>> hot(regions.begin(), regions.end());
-        const size_t num_hot = std::min<size_t>(hot.size(), 6);
-        std::partial_sort(
-            hot.begin(), hot.begin() + num_hot, hot.end(), [](const auto& a, const auto& b) {
-                return a.second.reads + a.second.writes > b.second.reads + b.second.writes;
-            });
-        std::string hot_list;
-        for (size_t i = 0; i < num_hot; ++i) {
-            hot_list += fmt::format(" {:#x}:{}r/{}w", hot[i].first << 16, hot[i].second.reads,
-                                    hot[i].second.writes);
-        }
-        LOG_INFO(Render,
-                 "Readbacks: {} faults ({} write, {} from GPU thread, {} empty, {} skipped), {} "
-                 "downloads ({} prefetched, {} ranges), {} KB, waited {:.1f} ms in queue + {:.1f} "
-                 "ms flushing in {:.1f} s, {} asynchronous ({:.1f} ms waited off the GPU thread), "
-                 "{} regions; hot 64K regions:{}",
-                 faults, write_faults, gpu_thread_faults, empty_faults,
-                 skipped.exchange(0, std::memory_order_relaxed),
-                 downloads.exchange(0, std::memory_order_relaxed),
-                 prefetches.exchange(0, std::memory_order_relaxed),
-                 ranges.exchange(0, std::memory_order_relaxed),
-                 bytes.exchange(0, std::memory_order_relaxed) / 1024,
-                 static_cast<double>(queue_ns) / 1e6, static_cast<double>(flush_ns) / 1e6,
-                 static_cast<double>(elapsed) / 1e9, async_jobs.exchange(0),
-                 static_cast<double>(async_wait_ns.exchange(0)) / 1e6, regions.size(), hot_list);
-        faults = write_faults = gpu_thread_faults = empty_faults = queue_ns = flush_ns = 0;
-        regions.clear();
-        window_start_ns = now;
-    }
-};
-ReadbackStats readback_stats;
-
-/// Whether readback windows that the guest keeps faulting on are downloaded together with the
-/// faulting one. Games often read back several GPU-written buffers every frame; downloading the
-/// recently hot ones while the GPU is already synchronized saves a full GPU wait per buffer.
-/// Can be disabled with SHADPS4_READBACK_PREFETCH=0.
-bool ReadbackPrefetchEnabled() {
-    if (g_flicker_lab_mode.load(std::memory_order_relaxed) == 1) {
-        return false;
-    }
-    static const bool enabled = [] {
-        const char* env = std::getenv("SHADPS4_READBACK_PREFETCH");
-        const bool value = env == nullptr || std::string_view{env} != "0";
-        LOG_INFO(Render, "Readback prefetch: {}", value ? "enabled" : "disabled");
-        return value;
-    }();
-    return enabled;
-}
-
-/// Readback windows the guest recently faulted on. Only accessed from the GPU thread.
+/// Readback windows the guest recently faulted on. Games often read back several GPU-written
+/// buffers every frame; downloading the recently hot ones together with the faulting one, while
+/// the GPU is already synchronized, saves a full GPU wait per buffer. GPU thread only.
 struct HotWindow {
     VAddr start;
     VAddr end;
@@ -269,95 +147,6 @@ void RememberHotWindow(VAddr start, VAddr end, s64 now) {
         }
     }
     *slot = HotWindow{.start = start, .end = end, .last_fault_ns = now};
-}
-
-/// Debug switch: SHADPS4_READBACK_TRACE=1 logs every guest fault on GPU-written memory with a
-/// hash of the data the guest will read, to see whether that data changes between frames.
-bool ReadbackTraceEnabled() {
-    static const bool enabled = [] {
-        const char* env = std::getenv("SHADPS4_READBACK_TRACE");
-        const bool value = env != nullptr && std::string_view{env} == "1";
-        LOG_INFO(Render, "Readback trace: {}", value ? "enabled" : "disabled");
-        return value;
-    }();
-    return enabled;
-}
-
-std::atomic<u64> readback_trace_lines{};
-
-u64 HashGuestLine(Core::MemoryManager* memory, VAddr address) {
-    std::array<u8, 64> line{};
-    memory->CopySparseMemory(address & ~VAddr{63}, line.data(), line.size());
-    u64 hash = 1469598103934665603ULL;
-    for (const u8 byte : line) {
-        hash = (hash ^ byte) * 1099511628211ULL;
-    }
-    return hash;
-}
-
-/// Whether readbacks requested by guest threads wait for the GPU on the faulting thread instead
-/// of the GPU thread, so command processing continues meanwhile. Can be disabled with
-/// SHADPS4_READBACK_ASYNC=0.
-bool ReadbackAsyncEnabled() {
-    if (g_flicker_lab_mode.load(std::memory_order_relaxed) == 1) {
-        return false;
-    }
-    static const bool enabled = [] {
-        const char* env = std::getenv("SHADPS4_READBACK_ASYNC");
-        const bool value = env == nullptr || std::string_view{env} != "0";
-        LOG_INFO(Render, "Asynchronous readbacks: {}", value ? "enabled" : "disabled");
-        return value;
-    }();
-    return enabled;
-}
-
-/// Buffer reads of memory that holds a rendered image. The buffer cache does not see image
-/// writes, so such reads may observe stale data. SHADPS4_BUF_IMAGE_SYNC=1 copies the image into
-/// the buffer before the read (like read-only texel buffers already do); 0 disables detection.
-enum class BufferImageMode { Off, Count, Sync };
-
-BufferImageMode GetBufferImageMode() {
-    if (g_flicker_lab_mode.load(std::memory_order_relaxed) == 4) {
-        return BufferImageMode::Sync;
-    }
-    static const BufferImageMode mode = [] {
-        const char* env = std::getenv("SHADPS4_BUF_IMAGE_SYNC");
-        const std::string_view value = env != nullptr ? env : "";
-        const BufferImageMode result = value == "1"   ? BufferImageMode::Sync
-                                       : value == "0" ? BufferImageMode::Off
-                                                      : BufferImageMode::Count;
-        LOG_INFO(Render, "Buffer reads of rendered images: {}",
-                 result == BufferImageMode::Sync    ? "synchronized"
-                 : result == BufferImageMode::Count ? "counted"
-                                                    : "ignored");
-        return result;
-    }();
-    return mode;
-}
-
-bool IsRenderedImageAt(VideoCore::TextureCache& texture_cache, VAddr device_addr) {
-    bool found = false;
-    texture_cache.ForEachImageWithAddress(
-        device_addr, [&](VideoCore::ImageId, VideoCore::Image& image) {
-            if (image.info.guest_address == device_addr &&
-                True(image.flags & VideoCore::ImageFlagBits::GpuModified) &&
-                (image.usage.render_target || image.usage.depth_target || image.usage.storage)) {
-                found = true;
-            }
-        });
-    return found;
-}
-
-bool OverlapsRenderedImage(VideoCore::TextureCache& texture_cache, VAddr device_addr, u32 size) {
-    bool found = false;
-    texture_cache.ForEachImageInRegion(
-        device_addr, size, [&](VideoCore::ImageId, VideoCore::Image& image) {
-            if (True(image.flags & VideoCore::ImageFlagBits::GpuModified) &&
-                (image.usage.render_target || image.usage.depth_target || image.usage.storage)) {
-                found = true;
-            }
-        });
-    return found;
 }
 
 /// A guest memory range whose GPU-written data is being downloaded.
@@ -414,11 +203,11 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     if (!is_write && !assume_locks && !memory_tracker->IsRegionGpuModified(device_addr, size)) {
         // Another thread downloaded this data while the fault was being raised; the access can
         // simply be retried without synchronizing with the GPU again.
-        readback_stats.skipped.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    const bool prefetch = ReadbackPrefetchEnabled();
-    const bool use_async = !is_write && !assume_locks && prefetch && ReadbackAsyncEnabled();
+    // Reads from guest threads wait for the GPU on the faulting thread instead of the GPU thread,
+    // so command processing continues meanwhile.
+    const bool use_async = !is_write && !assume_locks;
 
     // Runs on the GPU thread once an asynchronous readback has been written back. Windows the GPU
     // wrote to again in the meantime stay protected, so the guest faults and reads them again.
@@ -439,33 +228,28 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         std::erase(async_readbacks, job);
     };
 
-    s64 flush_start = 0;
-    s64 flush_end = 0;
-    bool downloaded = false;
     std::shared_ptr<AsyncReadback> async_job;
     const auto flush_request = [&] {
-        flush_start = ReadbackStats::Now();
-        const u64 downloads_before = readback_stats.downloads.load(std::memory_order_relaxed);
+        const s64 now = NowNs();
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
         const auto* arena = GetArena(first_block, last_block);
 
         // GPU-modified ranges come as many small scattered islands,
         // so the download is widened to a window around the request
-        const u64 window_size = ReadbackWindowSize();
+        constexpr u64 WindowSize = 512_KB;
         const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
         const VAddr window_start =
-            std::max<VAddr>(Common::AlignDown(device_addr, window_size), arena->cpu_addr);
+            std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), arena->cpu_addr);
         const VAddr window_end = std::min<VAddr>(
-            std::max<VAddr>(window_start + window_size, device_addr + size), arena_end);
-        RememberHotWindow(window_start, window_end, flush_start);
+            std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
+        RememberHotWindow(window_start, window_end, now);
 
         if (use_async) {
             // Another thread is already waiting for this data; wait for the same download.
             for (const auto& job : async_readbacks) {
                 if (job->Overlaps(window_start, window_end)) {
                     async_job = job;
-                    flush_end = ReadbackStats::Now();
                     return;
                 }
             }
@@ -480,134 +264,97 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             }
         }
 
-        if (!prefetch) {
-            DownloadMemory(arena, window_start, window_end - window_start);
-        } else {
-            // Download the faulting window together with the other windows the guest keeps
-            // reading back, using a single GPU submission for all of them.
-            auto job = std::make_shared<AsyncReadback>();
-            u64 total_size_bytes = 0;
-            const auto collect = [&](const Buffer* window_arena, VAddr start, u64 window_bytes) {
-                const size_t first_copy = job->copies.size();
-                const VAddr arena_base = window_arena->cpu_addr;
-                memory_tracker->ForEachDownloadRange<false>(
-                    start, window_bytes, [&](u64 address, u64 range_size) {
-                        gpu_modified_ranges.ForEachInRange(
-                            address, range_size, [&](VAddr range_start, VAddr range_end) {
-                                const u64 copy_size = range_end - range_start;
-                                job->copies.push_back(vk::BufferCopy{
-                                    .srcOffset = range_start - arena_base,
-                                    .dstOffset = total_size_bytes,
-                                    .size = copy_size,
-                                });
-                                // Align up to avoid cache conflicts
-                                total_size_bytes += Common::AlignUp(copy_size, 64ULL);
+        // Download the faulting window together with the other windows the guest keeps reading
+        // back, using a single GPU submission for all of them.
+        auto job = std::make_shared<AsyncReadback>();
+        u64 total_size_bytes = 0;
+        const auto collect = [&](const Buffer* window_arena, VAddr start, u64 window_bytes) {
+            const size_t first_copy = job->copies.size();
+            const VAddr arena_base = window_arena->cpu_addr;
+            memory_tracker->ForEachDownloadRange<false>(
+                start, window_bytes, [&](u64 address, u64 range_size) {
+                    gpu_modified_ranges.ForEachInRange(
+                        address, range_size, [&](VAddr range_start, VAddr range_end) {
+                            const u64 copy_size = range_end - range_start;
+                            job->copies.push_back(vk::BufferCopy{
+                                .srcOffset = range_start - arena_base,
+                                .dstOffset = total_size_bytes,
+                                .size = copy_size,
                             });
-                        gpu_modified_ranges.Subtract(address, range_size);
-                    });
-                job->windows.push_back(ReadbackWindow{
-                    .arena = window_arena,
-                    .start = start,
-                    .size = window_bytes,
-                    .first_copy = first_copy,
-                    .num_copies = job->copies.size() - first_copy,
+                            // Align up to avoid cache conflicts
+                            total_size_bytes += Common::AlignUp(copy_size, 64ULL);
+                        });
+                    gpu_modified_ranges.Subtract(address, range_size);
                 });
-            };
-            collect(arena, window_start, window_end - window_start);
-            for (const auto& window : hot_windows) {
-                if (window.end == 0 || window.start == window_start ||
-                    flush_start - window.last_fault_ns > HotWindowLifetimeNs ||
-                    !memory_tracker->IsRegionGpuModified(window.start, window.end - window.start) ||
-                    std::ranges::any_of(async_readbacks, [&](const auto& pending) {
-                        return pending->Overlaps(window.start, window.end);
-                    })) {
-                    continue;
-                }
-                const auto* hot_arena =
-                    GetArena(window.start >> block_shift, (window.end - 1) >> block_shift);
-                collect(hot_arena, window.start, window.end - window.start);
-                if (job->windows.back().num_copies != 0) {
-                    readback_stats.prefetches.fetch_add(1, std::memory_order_relaxed);
-                }
+            job->windows.push_back(ReadbackWindow{
+                .arena = window_arena,
+                .start = start,
+                .size = window_bytes,
+                .first_copy = first_copy,
+                .num_copies = job->copies.size() - first_copy,
+            });
+        };
+        collect(arena, window_start, window_end - window_start);
+        for (const auto& window : hot_windows) {
+            if (window.end == 0 || window.start == window_start ||
+                now - window.last_fault_ns > HotWindowLifetimeNs ||
+                !memory_tracker->IsRegionGpuModified(window.start, window.end - window.start) ||
+                std::ranges::any_of(async_readbacks, [&](const auto& pending) {
+                    return pending->Overlaps(window.start, window.end);
+                })) {
+                continue;
             }
+            const auto* hot_arena =
+                GetArena(window.start >> block_shift, (window.end - 1) >> block_shift);
+            collect(hot_arena, window.start, window.end - window.start);
+        }
 
-            // Windows without GPU-written data need no download.
+        // Windows without GPU-written data need no download.
+        for (const auto& window : job->windows) {
+            if (window.num_copies == 0) {
+                memory_tracker->UnmarkRegionAsGpuModified(window.start, window.size, false);
+            }
+        }
+        if (total_size_bytes != 0) {
+            job->staging = staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached,
+                                                0, use_async);
+            for (auto& copy : job->copies) {
+                copy.dstOffset += job->staging.offset;
+            }
             for (const auto& window : job->windows) {
-                if (window.num_copies == 0) {
-                    memory_tracker->UnmarkRegionAsGpuModified(window.start, window.size, false);
+                if (window.num_copies != 0) {
+                    runtime.CopyBuffer(
+                        window.arena, job->staging.buffer,
+                        std::span{job->copies.data() + window.first_copy, window.num_copies});
                 }
             }
-            if (total_size_bytes != 0) {
-                readback_stats.downloads.fetch_add(1, std::memory_order_relaxed);
-                readback_stats.ranges.fetch_add(job->copies.size(), std::memory_order_relaxed);
-                readback_stats.bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
-                job->staging = staging_pool.Request(
-                    total_size_bytes, VideoCore::MemoryType::HostCached, 0, use_async);
-                for (auto& copy : job->copies) {
-                    copy.dstOffset += job->staging.offset;
-                }
+            if (use_async) {
+                // Submit without waiting; the faulting thread waits for the data itself.
+                job->tick = scheduler.CurrentTick();
+                scheduler.Flush();
+                async_readbacks.push_back(job);
+                async_job = job;
+            } else {
+                scheduler.Finish();
+                job->WriteBack(memory);
                 for (const auto& window : job->windows) {
-                    if (window.num_copies != 0) {
-                        runtime.CopyBuffer(
-                            window.arena, job->staging.buffer,
-                            std::span{job->copies.data() + window.first_copy, window.num_copies});
-                    }
-                }
-                if (use_async) {
-                    // Submit without waiting; the faulting thread waits for the data itself.
-                    job->tick = scheduler.CurrentTick();
-                    scheduler.Flush();
-                    async_readbacks.push_back(job);
-                    async_job = job;
-                } else {
-                    scheduler.Finish();
-                    job->WriteBack(memory);
-                    for (const auto& window : job->windows) {
-                        memory_tracker->UnmarkRegionAsGpuModified(window.start, window.size, false);
-                    }
+                    memory_tracker->UnmarkRegionAsGpuModified(window.start, window.size, false);
                 }
             }
         }
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
-        downloaded = readback_stats.downloads.load(std::memory_order_relaxed) != downloads_before;
-        flush_end = ReadbackStats::Now();
     };
-    const s64 start = ReadbackStats::Now();
     if (assume_locks) {
         flush_request();
     } else {
         liverpool->SendCommand<true>(flush_request);
     }
     if (async_job) {
-        const s64 wait_start = ReadbackStats::Now();
         scheduler.GetWorkSemaphore()->Wait(async_job->tick);
         async_job->WriteBack(memory);
-        readback_stats.async_jobs.fetch_add(1, std::memory_order_relaxed);
-        readback_stats.async_wait_ns.fetch_add(ReadbackStats::Now() - wait_start,
-                                               std::memory_order_relaxed);
         liverpool->SendCommand<true>([&] { finish_async(async_job); });
-    }
-    readback_stats.Report(device_addr, is_write, assume_locks, downloaded,
-                          static_cast<u64>(flush_start - start),
-                          static_cast<u64>(flush_end - flush_start));
-    if (ReadbackTraceEnabled() && readback_trace_lines.fetch_add(1) < 30000) {
-        u64 copies = 0;
-        u64 copy_bytes = 0;
-        if (async_job) {
-            copies = async_job->copies.size();
-            for (const auto& copy : async_job->copies) {
-                copy_bytes += copy.size;
-            }
-        }
-        LOG_INFO(Render,
-                 "Readback trace: addr={:#x} size={} {} {} downloaded={} async={} copies={} "
-                 "bytes={} line_hash={:016x} still_gpu_modified={}",
-                 device_addr, size, is_write ? "write" : "read",
-                 assume_locks ? "gpu-thread" : "guest", downloaded, async_job != nullptr, copies,
-                 copy_bytes, HashGuestLine(memory, device_addr),
-                 memory_tracker->IsRegionGpuModified(device_addr, size));
     }
 }
 
@@ -638,9 +385,6 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
         return;
     }
-    readback_stats.downloads.fetch_add(1, std::memory_order_relaxed);
-    readback_stats.ranges.fetch_add(copies.size(), std::memory_order_relaxed);
-    readback_stats.bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
     const auto download = staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached);
     for (auto& copy : copies) {
         copy.dstOffset += download.offset;
@@ -659,20 +403,8 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
-    bool sync_image = false;
-    bool sync_overlaps = false;
-    if (!is_written && !is_texel_buffer && GetBufferImageMode() != BufferImageMode::Off &&
-        !texture_cache.IsMeta(device_addr) && IsRenderedImageAt(texture_cache, device_addr)) {
-        sync_image = GetBufferImageMode() == BufferImageMode::Sync;
-        TextureCacheNoteBufferRead(sync_image);
-    } else if (!is_written && GetBufferImageMode() != BufferImageMode::Off &&
-               OverlapsRenderedImage(texture_cache, device_addr, size)) {
-        TextureCacheNoteBufferOverlapRead();
-        sync_overlaps = g_flicker_lab_mode.load(std::memory_order_relaxed) == 6;
-    }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
-    if (!is_written && !sync_image && !sync_overlaps && size <= STREAM_THRESHOLD &&
-        !IsRegionGpuModified(device_addr, size)) {
+    if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         memory->CopySparseMemory(device_addr, data, size);
         stream_buffer.Commit();
@@ -682,10 +414,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const u64 last_block = (device_addr + size - 1) >> block_shift;
     const auto* arena = GetArena(first_block, last_block);
     EnsureResident(arena, first_block, last_block);
-    SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer || sync_image);
-    if (sync_overlaps) {
-        SynchronizeOverlappedImages(arena, device_addr, size);
-    }
+    SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
     }
@@ -776,6 +505,11 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
 }
 
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
+    // Ranges only ever become resident, so a range found fully resident stays that way.
+    auto& memo = resident_memo[(first_block * 0x9E3779B97F4A7C15ULL ^ last_block) >> 56];
+    if (memo.first == first_block && memo.last == last_block) {
+        return;
+    }
     u32 resident_blocks{};
     IntervalList bind_ranges;
     resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
@@ -784,6 +518,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     });
 
     if (bind_ranges.Empty()) {
+        memo = {first_block, last_block};
         return;
     }
 
@@ -854,41 +589,9 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         runtime.CopyBuffer(staging.buffer, arena, copies);
     }
     if (is_texel_buffer && !is_written) {
-        const bool synced = SynchronizeMemoryFromImage(arena, device_addr, size);
-        if (synced) {
-            TextureCacheNoteTexelSync();
-        }
-        return synced;
+        return SynchronizeMemoryFromImage(arena, device_addr, size);
     }
     return false;
-}
-
-void BufferCache::SynchronizeOverlappedImages(const Buffer* arena, VAddr device_addr, u32 size) {
-    // Copy the contents of rendered images overlapping this buffer into it, so the buffer read
-    // sees what was rendered. Each image is copied again only after it was used again.
-    static std::unordered_map<VAddr, u64> synced_ticks;
-    boost::container::small_vector<std::pair<VAddr, u32>, 4> images;
-    texture_cache.ForEachImageInRegion(device_addr, size, [&](ImageId, Image& image) {
-        if (False(image.flags & ImageFlagBits::GpuModified) ||
-            !(image.usage.render_target || image.usage.depth_target || image.usage.storage)) {
-            return;
-        }
-        u64& synced_tick = synced_ticks[image.info.guest_address];
-        if (synced_tick == image.tick_accessed_last + 1) {
-            return;
-        }
-        synced_tick = image.tick_accessed_last + 1;
-        images.emplace_back(image.info.guest_address, image.info.guest_size);
-    });
-    for (const auto& [image_addr, image_size] : images) {
-        const u64 first_block = image_addr >> block_shift;
-        const u64 last_block = (image_addr + image_size - 1) >> block_shift;
-        if (GetArena(first_block, last_block) != arena) {
-            continue;
-        }
-        EnsureResident(arena, first_block, last_block);
-        SynchronizeMemoryFromImage(arena, image_addr, image_size);
-    }
 }
 
 bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size) {

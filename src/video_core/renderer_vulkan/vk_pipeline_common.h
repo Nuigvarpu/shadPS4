@@ -60,6 +60,12 @@ public:
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
     void BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data) const;
 
+    /// Points a stage at another Info. Pipelines built on a worker thread are created from a copy
+    /// of the program Info and are re-pointed at the live one before their first use.
+    void SetStageInfo(size_t stage, const Shader::Info* info) noexcept {
+        stages[stage] = info;
+    }
+
 protected:
     [[nodiscard]] std::string GetDebugString() const;
 

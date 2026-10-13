@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -21,6 +22,10 @@ class VkCtxScope;
 }
 
 namespace Vulkan {
+
+/// Bumped when a command buffer starts recording or code outside the rasterizer binds a
+/// pipeline, so the rasterizer knows its record of the bound pipeline is no longer valid.
+inline std::atomic<u64> g_pipeline_bind_epoch{0};
 
 class Instance;
 

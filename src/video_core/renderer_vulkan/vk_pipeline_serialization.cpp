@@ -12,7 +12,7 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 7u;
+static constexpr u32 ShaderBinaryVersion = Storage::CacheFormatVersion;
 static constexpr u32 ShaderMetaVersion = 6u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization
@@ -157,7 +157,13 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     }
 
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
-    ASSERT(is_new);
+    if (!is_new) {
+        // The cache can hold the same pipeline twice (e.g. written by builds with different
+        // shader versions); keep the first one instead of crashing.
+        infos.fill(nullptr);
+        modules.fill(nullptr);
+        return true;
+    }
 
     it.value() =
         std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile, *pipeline_cache,
@@ -232,7 +238,13 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     }
 
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
-    ASSERT(is_new);
+    if (!is_new) {
+        // Duplicate entry in the cache, see LoadComputePipeline.
+        infos.fill(nullptr);
+        modules.fill(nullptr);
+        fetch_shader = nullptr;
+        return true;
+    }
 
     it.value() = std::make_unique<GraphicsPipeline>(
         instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,

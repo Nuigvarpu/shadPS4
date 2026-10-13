@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <deque>
 #include <boost/container/small_vector.hpp>
 
@@ -40,7 +41,10 @@ class BufferCache {
     static constexpr u64 ARENA_PAGE_SIZE = u64{1} << ARENA_PAGE_BITS;
     static constexpr u64 NUM_ARENA_PAGES = u64{1} << (ADDRESS_SPACE_BITS - ARENA_PAGE_BITS);
     static constexpr u64 MIN_BLOCK_SIZE = 16_KB;
-    static constexpr u64 STREAM_THRESHOLD = 16_KB;
+    /// Read-only buffers up to this size used to be copied into the stream buffer on every bind
+    /// instead of using the cached GPU copy. The copies cost more than they save (about 15% frame
+    /// rate in inFAMOUS Second Son), so the stream path is disabled.
+    static constexpr u64 STREAM_THRESHOLD = 0;
 
 public:
     explicit BufferCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
@@ -81,6 +85,9 @@ public:
 
     /// Invalidates any buffer in the logical page range.
     void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false);
+
+    /// Lets the guest write freely to the not GPU-modified pages around a write fault.
+    void InvalidateFaultWindow(VAddr device_addr, u64 size);
 
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false);
@@ -130,8 +137,6 @@ private:
 
     bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size);
 
-    void SynchronizeOverlappedImages(const Buffer* arena, VAddr device_addr, u32 size);
-
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
     Vulkan::Runtime& runtime;
@@ -166,6 +171,11 @@ private:
         }
     };
     IntervalList<Backing> resident_ranges;
+    struct ResidentMemo {
+        u64 first = ~0ULL;
+        u64 last = ~0ULL;
+    };
+    std::array<ResidentMemo, 256> resident_memo{};
 
     u32 arena_memory_type_index{};
     u32 block_size{};

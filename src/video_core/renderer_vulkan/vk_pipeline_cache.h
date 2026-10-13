@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <future>
+#include <memory>
+#include <optional>
 #include <variant>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
@@ -49,16 +52,32 @@ struct Program {
     Shader::Info info;
     ModuleList modules{};
 
+    /// Inputs of the last permutation lookup. When a draw uses the program with the same user
+    /// data, resource descriptors and register state, the specialization is the same, so the
+    /// permutation found last time is reused without rebuilding and comparing it.
+    struct LastLookup {
+        bool valid{};
+        std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
+        std::vector<u32> flat_buf;
+        Shader::RuntimeInfo runtime_info{};
+        Shader::Backend::Bindings start{};
+        VAddr pgm_base{};
+        size_t perm_idx{};
+        boost::container::small_vector<std::array<u32, 4>, 16> vs_sharps;
+    } last;
+
     Program() = default;
     Program(Shader::HwStage stage, Shader::SwStage l_stage, Shader::ShaderParams params)
         : info{stage, l_stage, params} {}
 
     void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec) {
+        last.valid = false;
         modules.emplace_back(module, std::move(spec));
     }
 
     void InsertPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
                       size_t perm_idx) {
+        last.valid = false;
         modules.resize(std::max(modules.size(), perm_idx + 1)); // <-- beware of realloc
         modules[perm_idx] = {module, std::move(spec)};
     }
@@ -67,6 +86,37 @@ struct Program {
 struct DrawIndirectParams {
     u16 vertex_sgpr_offset;
     u32 instance_sgpr_offset;
+};
+
+class PipelineCompileWorkers;
+
+/// A pipeline being built on a compile worker thread.
+struct PendingComputePipeline {
+    explicit PendingComputePipeline(const Shader::Info& info_) : info{info_} {}
+
+    Shader::Info info;
+    const Shader::Info* live_info{};
+    ComputePipelineKey key{};
+    vk::ShaderModule module{};
+    ComputePipeline::SerializationSupport sdata{};
+    std::unique_ptr<ComputePipeline> pipeline;
+    std::promise<void> promise;
+    std::shared_future<void> done;
+};
+
+struct PendingGraphicsPipeline {
+    std::array<std::optional<Shader::Info>, MaxShaderStages> info_storage;
+    std::array<const Shader::Info*, MaxShaderStages> infos{};
+    std::array<const Shader::Info*, MaxShaderStages> live_infos{};
+    std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+    std::optional<Shader::Gcn::FetchShaderData> fetch_shader;
+    std::array<vk::ShaderModule, MaxShaderStages> modules{};
+    GraphicsPipelineKey key{};
+    size_t hash{};
+    GraphicsPipeline::SerializationSupport sdata{};
+    std::unique_ptr<GraphicsPipeline> pipeline;
+    std::promise<void> promise;
+    std::shared_future<void> done;
 };
 
 class PipelineCache {
@@ -118,6 +168,12 @@ private:
         return num_new_pipelines > 0;
     }
 
+    PipelineCompileWorkers& CompileWorkers();
+    const ComputePipeline* GetComputePipelineAsync();
+    void FinishReadyPipelines();
+    const GraphicsPipeline* GetGraphicsPipelineAsync();
+    void MaybeFinishReadyPipelines();
+
 private:
     const Instance& instance;
     Scheduler& scheduler;
@@ -138,6 +194,13 @@ private:
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+
+    // Pipelines not compiled yet are built on worker threads and the draws or dispatches that
+    // need them are skipped until they are ready.
+    std::unique_ptr<PipelineCompileWorkers> compile_workers;
+    tsl::robin_map<ComputePipelineKey, std::shared_ptr<PendingComputePipeline>> pending_compute;
+    tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<PendingGraphicsPipeline>> pending_graphics;
+    u32 finish_check_calls{};
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

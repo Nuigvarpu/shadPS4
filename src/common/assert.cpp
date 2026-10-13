@@ -3,6 +3,7 @@
 
 #include "common/arch.h"
 #include "common/assert.h"
+#include "core/crash_report.h"
 #include "core/signals.h"
 #include "emulator.h"
 
@@ -15,6 +16,9 @@
 #endif
 
 void assert_fail_impl() {
+    // Before removing the signal handlers: other threads still rely on them (e.g. for memory
+    // tracking faults) while the report is written.
+    Core::CrashReport::Write("Fallo de asercion o codigo inalcanzable (ver el final del log)");
     Core::Signals::Instance()->RemoveHandlers();
     Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     Crash();

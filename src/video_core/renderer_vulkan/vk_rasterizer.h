@@ -73,6 +73,7 @@ public:
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
+    void ExpandWriteFault(VAddr addr);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
@@ -154,6 +155,49 @@ private:
         VideoCore::TextureCache::ImageDesc desc;
     };
     std::array<ImageBinding, Shader::NUM_IMAGES> image_bindings;
+
+    /// Image descriptions built from T# by BindTextures. Building one computes the guest image
+    /// layout, which is costly, while the same few hundred T# are bound draw after draw.
+    struct TextureDescKey {
+        std::array<u64, 4> sharp;
+        u32 flags;
+
+        bool operator==(const TextureDescKey&) const = default;
+
+        template <typename H>
+        friend H AbslHashValue(H h, const TextureDescKey& key) {
+            return H::combine(std::move(h), key.sharp[0], key.sharp[1], key.sharp[2], key.sharp[3],
+                              key.flags);
+        }
+    };
+    absl::flat_hash_map<TextureDescKey, VideoCore::TextureCache::ImageDesc> texture_desc_cache;
+
+    /// Pipeline last bound per bind point, to skip binding it again for the next draw.
+    struct BoundPipeline {
+        vk::CommandBuffer cmdbuf{};
+        vk::Pipeline pipeline{};
+        u64 epoch{};
+    };
+    std::array<BoundPipeline, 2> bound_pipelines{};
+    /// Vertex and index buffers last bound, to skip binding the same ones again.
+    struct BoundVertexBuffers {
+        vk::CommandBuffer cmdbuf{};
+        u64 epoch{};
+        VertexInputs<vk::Buffer> buffers;
+        VertexInputs<vk::DeviceSize> offsets;
+        VertexInputs<vk::DeviceSize> sizes;
+        VertexInputs<vk::DeviceSize> strides;
+    } bound_vertex_buffers;
+    struct BoundIndexBuffer {
+        vk::CommandBuffer cmdbuf{};
+        u64 epoch{};
+        vk::Buffer buffer{};
+        u64 offset{};
+        u32 size{};
+        vk::IndexType type{};
+    } bound_index_buffer;
+    void BindPipeline(vk::CommandBuffer cmdbuf, vk::PipelineBindPoint bind_point,
+                      vk::Pipeline pipeline);
     std::array<ImageBinding, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     ImageBinding db_desc;
 

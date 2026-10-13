@@ -31,7 +31,6 @@
 #include <chrono>
 #include <cmath>
 #include <csetjmp>
-#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -39,20 +38,13 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <span>
 #include <sstream>
-#include <string_view>
 #include <system_error>
 #include <vector>
 #include <imgui.h>
 #include <stb_image_write.h>
 #include <vk_mem_alloc.h>
-
-namespace VideoCore {
-// Experiment selected by the flicker lab, defined in texture_cache.cpp.
-extern std::atomic<u32> g_flicker_lab_mode;
-} // namespace VideoCore
 
 namespace Vulkan {
 
@@ -470,171 +462,6 @@ static void SavePendingScreenshot(const ScreenshotReadback& readback) {
     }
 }
 
-/// Flicker lab (SHADPS4_FLICKER_LAB=1): measures frame-to-frame flicker of the guest output while
-/// cycling through rendering experiments, so their effect can be compared on a static scene (for
-/// example a paused game). Every window of SHADPS4_FLICKER_LAB_SECONDS (default 10) seconds selects
-/// the next experiment and logs how many pixels changed and changed back between three frames.
-/// A few frames of each window are saved as PNG files under screenshots/flicker_lab.
-namespace FlickerLab {
-
-constexpr std::array<const char*, 7> ModeNames = {
-    "baseline",          "sync-readbacks", "sync-submits",       "texture-reupload",
-    "buffer-image-sync", "full-barriers",  "overlap-image-sync",
-};
-constexpr u32 GridWidth = 240;
-constexpr u32 GridHeight = 135;
-constexpr u32 SaveWidth = 480;
-constexpr u32 SaveHeight = 270;
-constexpr u32 SettleSeconds = 2;
-constexpr u32 FramesSavedPerWindow = 4;
-constexpr u32 SavedWindowsPerMode = 2;
-constexpr double StaticMotion = 2.0;
-
-bool Enabled() {
-    static const bool enabled = [] {
-        const char* env = std::getenv("SHADPS4_FLICKER_LAB");
-        const bool value = env != nullptr && std::string_view{env} == "1";
-        LOG_INFO(Render_Vulkan, "Flicker lab: {}", value ? "enabled" : "disabled");
-        return value;
-    }();
-    return enabled;
-}
-
-u32 WindowSeconds() {
-    static const u32 seconds = [] {
-        const char* env = std::getenv("SHADPS4_FLICKER_LAB_SECONDS");
-        const u32 value = env != nullptr ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 0;
-        return value >= 4 && value <= 120 ? value : 10u;
-    }();
-    return seconds;
-}
-
-struct State {
-    std::mutex mutex;
-    std::array<std::vector<u8>, 3> history{};
-    u32 history_count{};
-    std::chrono::steady_clock::time_point window_start{};
-    u32 window{};
-    bool started{};
-    u32 frames{};
-    u32 scored_frames{};
-    double flicker_sum{};
-    double flicker_max{};
-    double motion_sum{};
-    u32 saved{};
-    std::array<u32, ModeNames.size()> saved_windows{};
-};
-State state;
-
-void LogWindow() {
-    const u32 mode = state.window % ModeNames.size();
-    LOG_INFO(Render_Vulkan,
-             "Flicker lab: window {} mode {} ({}): {} frames, {} scored, flicker {:.3f}% (max "
-             "{:.3f}%), motion {:.2f}",
-             state.window, mode, ModeNames[mode], state.frames, state.scored_frames,
-             state.scored_frames ? state.flicker_sum / state.scored_frames : 0.0, state.flicker_max,
-             state.scored_frames ? state.motion_sum / state.scored_frames : 0.0);
-}
-
-void StartWindow(std::chrono::steady_clock::time_point now) {
-    if (state.saved > 0) {
-        ++state.saved_windows[state.window % ModeNames.size()];
-    }
-    state.window_start = now;
-    state.frames = 0;
-    state.scored_frames = 0;
-    state.flicker_sum = 0.0;
-    state.flicker_max = 0.0;
-    state.motion_sum = 0.0;
-    state.saved = 0;
-    state.history_count = 0;
-    const u32 mode = state.window % ModeNames.size();
-    VideoCore::g_flicker_lab_mode.store(mode, std::memory_order_relaxed);
-    LOG_INFO(Render_Vulkan, "Flicker lab: window {} starts mode {} ({})", state.window, mode,
-             ModeNames[mode]);
-}
-
-void SaveFrame(const std::vector<u8>& rgba, u32 width, u32 height) {
-    std::vector<u8> small(SaveWidth * SaveHeight * 4);
-    for (u32 y = 0; y < SaveHeight; ++y) {
-        const u32 src_y = y * height / SaveHeight;
-        for (u32 x = 0; x < SaveWidth; ++x) {
-            const u32 src_x = x * width / SaveWidth;
-            std::memcpy(&small[(y * SaveWidth + x) * 4], &rgba[(src_y * width + src_x) * 4], 4);
-        }
-    }
-    const auto dir = Common::FS::GetUserPath(Common::FS::PathType::ScreenshotsDir) / "flicker_lab";
-    std::error_code ec{};
-    std::filesystem::create_directories(dir, ec);
-    const u32 mode = state.window % ModeNames.size();
-    const auto path =
-        dir / fmt::format("w{:02}_{}_{}_{}.png", state.window, mode, ModeNames[mode], state.saved);
-    WritePng(path, small, SaveWidth, SaveHeight);
-}
-
-void OnFrame(const std::vector<u8>& rgba, u32 width, u32 height) {
-    std::scoped_lock lk{state.mutex};
-    const auto now = std::chrono::steady_clock::now();
-    if (!state.started) {
-        state.started = true;
-        StartWindow(now);
-    } else if (now - state.window_start >= std::chrono::seconds{WindowSeconds()}) {
-        LogWindow();
-        ++state.window;
-        StartWindow(now);
-    }
-    ++state.frames;
-
-    // Luma on a coarse grid.
-    std::vector<u8> luma(GridWidth * GridHeight);
-    for (u32 y = 0; y < GridHeight; ++y) {
-        const u32 src_y = (y * height + height / 2) / GridHeight;
-        for (u32 x = 0; x < GridWidth; ++x) {
-            const u32 src_x = (x * width + width / 2) / GridWidth;
-            const u8* px = &rgba[(static_cast<u64>(src_y) * width + src_x) * 4];
-            luma[y * GridWidth + x] = static_cast<u8>((px[0] * 54 + px[1] * 183 + px[2] * 19) >> 8);
-        }
-    }
-    state.history[0] = std::move(state.history[1]);
-    state.history[1] = std::move(state.history[2]);
-    state.history[2] = std::move(luma);
-    state.history_count = std::min(state.history_count + 1, 3u);
-
-    if (now - state.window_start < std::chrono::seconds{SettleSeconds} || state.history_count < 3) {
-        return;
-    }
-    const auto& a = state.history[0];
-    const auto& b = state.history[1];
-    const auto& c = state.history[2];
-    u32 flicker = 0;
-    u64 motion = 0;
-    for (size_t i = 0; i < c.size(); ++i) {
-        const int ab = std::abs(int(b[i]) - int(a[i]));
-        const int bc = std::abs(int(c[i]) - int(b[i]));
-        const int ac = std::abs(int(c[i]) - int(a[i]));
-        if (ab > 24 && bc > 24 && ac < 12) {
-            ++flicker;
-        }
-        motion += bc;
-    }
-    const double flicker_pct = 100.0 * flicker / c.size();
-    ++state.scored_frames;
-    state.flicker_sum += flicker_pct;
-    state.flicker_max = std::max(state.flicker_max, flicker_pct);
-    state.motion_sum += static_cast<double>(motion) / c.size();
-
-    // Keep a few consecutive frames of static scenes (such as the pause menu) for inspection.
-    const u32 mode = state.window % ModeNames.size();
-    const bool is_static = static_cast<double>(motion) / c.size() < StaticMotion;
-    if (state.saved_windows[mode] < SavedWindowsPerMode && state.saved < FramesSavedPerWindow &&
-        (state.saved > 0 || is_static)) {
-        SaveFrame(rgba, width, height);
-        ++state.saved;
-    }
-}
-
-} // namespace FlickerLab
-
 Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_)
     : window{window_}, liverpool{liverpool_},
       instance{window, EmulatorSettings.GetGpuId(), EmulatorSettings.IsVkValidationEnabled(),
@@ -905,32 +732,6 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             .imageExtent = {readback.width, readback.height, 1},
         };
         runtime.DownloadImage(&image, &readback.buffer, std::span{&copy_region, 1});
-    }
-
-    if (FlickerLab::Enabled()) {
-        auto readback = std::make_shared<ScreenshotReadback>(
-            instance, ScreenshotKind::GameOnly, std::vector<std::filesystem::path>{},
-            image_size.width, image_size.height, view_info.format, false);
-        const vk::BufferImageCopy copy_region = {
-            .bufferOffset = 0,
-            .bufferRowLength = 0,
-            .bufferImageHeight = 0,
-            .imageSubresource{
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
-                .mipLevel = 0,
-                .baseArrayLayer = 0,
-                .layerCount = 1,
-            },
-            .imageOffset = {0, 0, 0},
-            .imageExtent = {readback->width, readback->height, 1},
-        };
-        runtime.DownloadImage(&image, &readback->buffer, std::span{&copy_region, 1});
-        draw_scheduler.DeferPriorityOperation([readback] {
-            std::vector<u8> rgba;
-            if (ConvertReadbackToRgba8(*readback, rgba)) {
-                FlickerLab::OnFrame(rgba, readback->width, readback->height);
-            }
-        });
     }
 
     // Continue with host-side passes that draw the displayed (scaled) frame.

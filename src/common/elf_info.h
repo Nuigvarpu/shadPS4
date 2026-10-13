@@ -103,6 +103,10 @@ public:
         return *Singleton<ElfInfo>::Instance();
     }
 
+    [[nodiscard]] bool IsInitialized() const {
+        return initialized;
+    }
+
     [[nodiscard]] std::string_view GameSerial() const {
         ASSERT(initialized);
         return Instance().game_serial;

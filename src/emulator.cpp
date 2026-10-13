@@ -73,6 +73,17 @@ Emulator::Emulator() {
 #ifdef _WIN32
     Common::NtApi::Initialize();
     SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+    // Windows slows down processes whose window is not focused (EcoQoS: efficiency cores and lower
+    // clocks), which costs a CPU-bound emulator a lot of frames. Opt out of it.
+    PROCESS_POWER_THROTTLING_STATE power_throttling{};
+    power_throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    power_throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+#ifdef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+    power_throttling.ControlMask |= PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+#endif
+    power_throttling.StateMask = 0;
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &power_throttling,
+                          sizeof(power_throttling));
     SetErrorMode(SetErrorMode(0) | SEM_NOGPFAULTERRORBOX);
     // need to init this in order for winsock2 to work
     WORD versionWanted = MAKEWORD(2, 2);

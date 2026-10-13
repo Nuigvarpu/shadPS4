@@ -1,0 +1,46 @@
+shadPS4 para inFAMOUS Second Son (fork no oficial)
+==================================================
+
+AVISOS
+- El juego NO viene incluido. Necesitas tu propia copia (CUSA00004) y la actualizacion 1.07.
+- Proyecto no oficial, sin relacion con el equipo de shadPS4, Sony ni Sucker Punch.
+- El juego NO esta probado al 100%. Se probo sobre todo el inicio.
+
+INSTALACION
+1. Instala Microsoft Visual C++ 2015-2022 x64 si no lo tienes:
+   https://aka.ms/vs/17/release/vc_redist.x64.exe
+2. Organiza el juego asi (la actualizacion 1.07 extraida en una carpeta hermana):
+     PS4Games\CUSA00004\
+     PS4Games\CUSA00004-UPDATE\
+3. Descomprime este zip en una carpeta donde puedas escribir (no en Archivos de programa).
+4. Ejecuta Configurar_primera_vez.bat (solo una vez, o de nuevo si mueves la carpeta).
+5. Abre shadPS4QtLauncher.exe, elige la carpeta PS4Games y juega.
+   Arriba a la derecha debe estar seleccionado "inFAMOUS SS (shadPS4 mod)".
+
+La primera partida va mas lenta mientras se compilan los shaders. Algunos efectos
+pueden tardar un instante en aparecer la primera vez.
+
+CONTROLES
+- Mando DualSense, DualShock 4 o Xbox: funciona directamente.
+- Escena del grafiti (agitar la lata): manten pulsada la tecla G.
+
+LIMITE DE FPS
+- Por defecto: 30 fps (mas estable).
+- Para quitarlo: en %APPDATA%\shadPS4\custom_configs\CUSA00004.json
+  cambia "fps_limit": 30 por "fps_limit": 0
+
+SI EL JUEGO SE CIERRA POR UN ERROR
+Se crean 3 archivos en %APPDATA%\shadPS4\log\ :
+  crash_<fecha>.txt, crash_<fecha>.dmp y crash_<fecha>_log.txt
+Envialos con una descripcion de lo que estabas haciendo, abriendo un Issue en:
+  https://github.com/Nuigvarpu/shadPS4
+
+LIMITACIONES CONOCIDAS
+- A veces la iluminacion parpadea o "palpita" (intermitente, en investigacion).
+- Sin limite: unos 33-35 fps en escenas pesadas con fuego. Aun no llega a 60 fps.
+- Solo Windows.
+
+Licencia: GPL-2.0-or-later (ver LICENSE). Codigo fuente y detalles en:
+  https://github.com/Nuigvarpu/shadPS4/tree/infamous-second-son
+La interfaz shadPS4QtLauncher es la oficial de shadPS4, sin modificar:
+  https://github.com/shadps4-emu/shadps4-qtlauncher

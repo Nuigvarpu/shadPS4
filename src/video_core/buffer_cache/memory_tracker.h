@@ -55,6 +55,40 @@ public:
         });
     }
 
+    /// Marks the pages of a region that hold no unsynchronized GPU data as CPU modified, so a guest
+    /// writing through memory sequentially takes one fault per window instead of one per page.
+    void MarkCleanPagesAsCpuModified(VAddr cpu_addr, u64 size) noexcept {
+        if (readbacks_mode == GpuReadbacksMode::Disabled) {
+            // Without readbacks GPU written pages are not tracked, so they cannot be told apart.
+            return;
+        }
+        IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+            const auto bounds = manager->GetBounds(offset, size);
+            manager->Lock(bounds);
+            u64 run_start = 0;
+            u64 run_size = 0;
+            const auto flush_run = [&] {
+                if (run_size != 0) {
+                    manager->template ChangeRegionState<StateOp::Set, StateOp::None, false>(
+                        run_start, run_size);
+                    run_size = 0;
+                }
+            };
+            for (u64 page = offset; page < offset + size; page += BYTES_PER_PAGE) {
+                if (manager->template IsRegionModified<Type::GPU>(page, BYTES_PER_PAGE)) {
+                    flush_run();
+                    continue;
+                }
+                if (run_size == 0) {
+                    run_start = page;
+                }
+                run_size += BYTES_PER_PAGE;
+            }
+            flush_run();
+            manager->Unlock(bounds);
+        });
+    }
+
     /// Removes all protection from a page and ensures GPU data has been flushed if requested
     void InvalidateRegion(VAddr cpu_addr, u64 size, auto&& on_flush) noexcept {
         if (readbacks_mode == GpuReadbacksMode::Disabled) {

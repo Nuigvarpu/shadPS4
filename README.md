@@ -1,211 +1,233 @@
-<!--
-SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
-SPDX-License-Identifier: GPL-2.0-or-later
--->
+# shadPS4 para inFAMOUS Second Son (fork no oficial)
 
-<h1 align="center">
-  <br>
-  <a href="https://shadps4.net/"><img src="https://github.com/shadps4-emu/shadPS4/blob/main/.github/shadps4.png" width="220"></a>
-  <br>
-  <b>shadPS4</b>
-  <br>
-</h1>
-
-<h1 align="center">
- <a href="https://discord.gg/bFJxfftGW6">
-        <img src="https://img.shields.io/discord/1080089157554155590?color=5865F2&label=shadPS4%20Discord&logo=Discord&logoColor=white" width="275">
- <a href="https://github.com/shadps4-emu/shadPS4/releases/latest">
-        <img src="https://img.shields.io/github/downloads/shadps4-emu/shadPS4/total.svg" width="140">
- <a href="https://shadps4.net/">
-        <img src="https://img.shields.io/badge/shadPS4-website-8A2BE2" width="150">
- <a href="https://x.com/shadps4">
-        <img src="https://img.shields.io/badge/-Join%20us-black?logo=X&logoColor=white" width="100">
- <a href="https://github.com/shadps4-emu/shadPS4/stargazers">
-        <img src="https://img.shields.io/github/stars/shadps4-emu/shadPS4" width="120">
-</h1>
-
-|               Bloodborne by From Software                   |                     Hatsune Miku Project DIVA Future Tone by SEGA                         |
-| :-----------------------------------------------------------: | :--------------------------------------------------------------------------------------------: |
-| ![Bloodborne screenshot](./documents/Screenshots/1.png) | ![Project DIVA screenshot](./documents/Screenshots/2.png) |
-
-|                  Yakuza 0 by SEGA                     |                 DRIVECLUB™ by Evolution Studios                    |
-| :------------------------------------------------------------------------: | :------------------------------------------------------------------: |
-| ![Yakuza screenshot](./documents/Screenshots/3.png) | ![DRIVECLUB screenshot](./documents/Screenshots/4.png) |
-
-# General information
-
-**shadPS4** is an early **PlayStation 4** emulator for **Windows**, **Linux** and **macOS** written in C++.
+Versión modificada del emulador de PS4 **[shadPS4](https://github.com/shadps4-emu/shadPS4)**, ajustada para jugar **inFAMOUS Second Son** (CUSA00004, actualización 1.07) en PC con Windows.
 
 > [!IMPORTANT]
-> This is the emulator core, which does not include a GUI. If you just want to use the emulator as an end user, download the [**QtLauncher**](https://github.com/shadps4-emu/shadps4-qtlauncher/releases) instead.
+> - **El juego NO viene incluido.** Este proyecto no contiene el juego ni la actualización, y no da enlaces para conseguirlos. Necesitas tu propia copia legal: un volcado de tu disco o de tu consola, más la actualización 1.07 de tu cuenta.
+> - **Es un proyecto no oficial.** No está afiliado al equipo de shadPS4, a Sony Interactive Entertainment ni a Sucker Punch Productions. Las marcas pertenecen a sus dueños.
+> - **El juego NO ha sido probado al 100 %.** Se probó sobre todo el inicio del juego y las primeras zonas, incluida la escena del fuego. Puede haber fallos más adelante que todavía no conocemos (ver [Informes de fallo](#informes-de-fallo)).
 
-If you encounter problems or have doubts, do not hesitate to look at the [**Quickstart**](https://github.com/shadps4-emu/shadPS4/wiki/I.-Quick-start-%5BUsers%5D).\
-To verify that a game works, you can look at [**shadPS4 Game Compatibility**](https://github.com/shadps4-compatibility/shadps4-game-compatibility).\
-To discuss shadPS4 development, suggest ideas or to ask for help, join our [**Discord server**](https://discord.gg/bFJxfftGW6).\
-To get the latest news, go to our [**X (Twitter)**](https://x.com/shadps4) or our [**website**](https://shadps4.net/).\
-You can donate to the project via our [**Kofi page**](https://ko-fi.com/shadps4).
+---
 
-# Status
+## Índice
+1. [Qué incluye](#qué-incluye)
+2. [Requisitos y PC de pruebas](#requisitos-y-pc-de-pruebas)
+3. [Instalación y uso](#instalación-y-uso)
+4. [Ajustes](#ajustes)
+5. [Informes de fallo](#informes-de-fallo)
+6. [Cambios respecto a shadPS4](#cambios-respecto-a-shadps4)
+7. [Limitaciones conocidas](#limitaciones-conocidas)
+8. [En qué estamos trabajando](#en-qué-estamos-trabajando)
+9. [Compilar desde el código](#compilar-desde-el-código)
+10. [Licencia y créditos](#licencia-y-créditos)
 
-> [!IMPORTANT]
-> shadPS4 is early in development, don't expect a flawless experience.
+---
 
-Currently, the emulator can successfully run games like [**Bloodborne**](https://www.youtube.com/watch?v=5sZgWyVflFM), [**Dark Souls Remastered**](https://www.youtube.com/watch?v=-3PA-Xwszts), [**Red Dead Redemption**](https://www.youtube.com/watch?v=Al7yz_5nLag), and many other games.
+## Qué incluye
 
-# Why
+El paquete de la sección **Releases** trae:
 
-This project began for fun. Given our limited free time, it may take some time before shadPS4 can run more complex games, but we're committed to making small, regular updates.
+| Archivo o carpeta | Qué es |
+|---|---|
+| `shadPS4QtLauncher.exe` y sus DLL | La interfaz **oficial** de shadPS4 ([shadps4-qtlauncher](https://github.com/shadps4-emu/shadps4-qtlauncher)), sin modificar. |
+| `emulador\shadPS4.exe` | El emulador con las mejoras de este fork. |
+| `config\CUSA00004.json` | Ajustes recomendados para inFAMOUS Second Son. |
+| `Configurar_primera_vez.bat` | Registra el emulador en la interfaz y copia los ajustes del juego. |
+| `LEEME.txt` | Instrucciones rápidas. |
+| `LICENSE` | Licencia GPL-2.0. |
 
-# Building
+---
 
-## Docker
+## Requisitos y PC de pruebas
 
-For building shadPS4 in a containerized environment using Docker and VSCode, check the instructions here:  
-[**Docker Build Instructions**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-docker.md)
+**Requisitos:**
+- Windows 10 o 11 de 64 bits.
+- Una tarjeta gráfica con Vulkan 1.3 y drivers recientes.
+- [Microsoft Visual C++ 2015-2022 (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe), que necesita la interfaz.
+- Tu copia de inFAMOUS Second Son (CUSA00004) con la **actualización 1.07**.
 
-## Windows
+**PC donde se hicieron todas las pruebas:**
 
-Check the build instructions for [**Windows**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-windows.md).
+| Componente | Modelo |
+|---|---|
+| Equipo | Laptop Lenovo LOQ 15IRX10 |
+| Procesador | Intel Core i7-13650HX (14 núcleos: 6 P + 8 E) |
+| Gráfica | NVIDIA GeForce RTX 5050 Laptop GPU, driver 617.14 |
+| RAM | 32 GB DDR5 |
+| Sistema | Windows 11 Home |
+| Almacenamiento | SSD |
 
-## Linux
+En otros equipos el rendimiento puede ser distinto. Tampoco se ha probado con gráficas AMD ni Intel.
 
-Check the build instructions for [**Linux**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-linux.md).
+---
 
-## macOS
+## Instalación y uso
 
-Check the build instructions for [**macOS**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-macos.md).
+### 1. Prepara el juego
+El emulador lee el juego como una carpeta ya extraída. La estructura debe quedar así:
 
-> [!IMPORTANT]
-> macOS users need at least macOS 26.0 to run shadPS4. Intel Macs are not supported.
-
-# Usage examples
-
-> [!IMPORTANT]
-> For a user-friendly GUI, download the [**QtLauncher**](https://github.com/shadps4-emu/shadps4-qtlauncher/releases).
-
-To get the list of all available commands and also a more detailed description of what each command does, please refer to the `--help` flag's output.
-
-Below is a list of commonly used command patterns:
-```sh
-shadPS4 CUSA00001 # Searches for a game folder called CUSA00001 in the list of game install folders, and boots it.
-shadPS4 --fullscreen true --config-clean CUSA00001    # the game argument is always the last one,
-shadPS4 -g CUSA00001 --fullscreen true --config-clean # ...unless manually specified otherwise.
-shadPS4 /path/to/game.elf # Boots a PS4 ELF file directly. Useful if you want to boot an executable that is not named eboot.bin.
-shadPS4 CUSA00001 -- -flag1 -flag2 # Passes '-flag1' and '-flag2' to the game executable in argv.
+```
+PS4Games\
+├── CUSA00004\           ← el juego base (contiene eboot.bin, sce_sys\...)
+└── CUSA00004-UPDATE\    ← la actualización 1.07, extraída en una carpeta hermana
 ```
 
-# Debugging and reporting issues
+- Saca el juego base de **tu** disco o consola.
+- Extrae el `.pkg` de **tu** actualización 1.07 (`...-A0107-V0100.pkg`) en una carpeta llamada exactamente `CUSA00004-UPDATE`, junto a `CUSA00004`. Para extraerlo hace falta una herramienta de extracción de PKG de PS4.
+- Aquí no se distribuyen el juego, la actualización ni las claves.
 
-For more information on how to test, debug and report issues with the emulator or games, read the [**Debugging documentation**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/Debugging/Debugging.md).
+### 2. Descomprime el paquete
+Descomprime el zip del Release en una carpeta donde tengas permiso de escritura. Por ejemplo, `Documentos\inFAMOUS-shadPS4`. No uses `Archivos de programa`.
 
-# Keyboard and Mouse Mappings
+### 3. Configura (solo la primera vez)
+Haz doble clic en **`Configurar_primera_vez.bat`**. El script:
+- registra `emulador\shadPS4.exe` en la interfaz, con el nombre **"inFAMOUS SS (shadPS4 mod)"**;
+- copia los ajustes recomendados a `%APPDATA%\shadPS4\custom_configs\CUSA00004.json`. Si ya tenías ese archivo, lo guarda antes como `CUSA00004.json.bak`.
 
-> [!NOTE]
-> Some keyboards may also require you to hold the Fn key to use the F\* keys. Mac users should use the Command key instead of Control, and need to use Command+F11 for full screen to avoid conflicting with system key bindings.
+Si mueves la carpeta a otro sitio, vuelve a ejecutarlo.
 
-| Button | Function |
-|-------------|-------------|
-F10 | FPS Counter
-Ctrl+F10 | Video Debug Info
-F11 | Fullscreen
-F12 | Trigger RenderDoc Capture (or game-only screenshot if RenderDoc is unavailable)
-Alt+F12 | Capture screenshot including HUD/dialog overlays
+### 4. Juega
+1. Abre **`shadPS4QtLauncher.exe`** desde esa misma carpeta.
+2. La primera vez te pedirá la carpeta de juegos. Elige la carpeta que contiene `CUSA00004` (en el ejemplo, `PS4Games`).
+3. Arriba a la derecha, comprueba que la versión seleccionada sea **"inFAMOUS SS (shadPS4 mod)"**.
+4. Haz doble clic en inFAMOUS Second Son.
 
-> [!NOTE]
-> Xbox and DualShock controllers work out of the box.
+**La primera partida va más lenta:** el emulador compila los shaders del juego y los guarda en caché. Por eso algunos efectos pueden tardar un instante en aparecer. Desde la segunda vez va más fluido.
 
-| Controller button | Keyboard equivalent |
-|-------------|-------------|
-LEFT AXIS UP | W |
-LEFT AXIS DOWN | S |
-LEFT AXIS LEFT | A |
-LEFT AXIS RIGHT | D |
-RIGHT AXIS UP | I |
-RIGHT AXIS DOWN | K |
-RIGHT AXIS LEFT | J |
-RIGHT AXIS RIGHT | L |
-TRIANGLE | Numpad 8 or C |
-CIRCLE | Numpad 6 or B |
-CROSS | Numpad 2 or N |
-SQUARE | Numpad 4 or V |
-PAD UP | UP |
-PAD DOWN | DOWN |
-PAD LEFT | LEFT |
-PAD RIGHT | RIGHT |
-OPTIONS | RETURN |
-BACK BUTTON / TOUCH PAD | SPACE |
-L1 | Q |
-R1 | U |
-L2 | E |
-R2 | O |
-L3 | X |
-R3 | M |
+### Controles
+- Mando: un DualSense o DualShock 4 funciona directamente. Un mando de Xbox también funciona.
+- Teclado y ratón: se configuran desde la interfaz.
+- **Agitar el mando (escena del grafiti con la lata de spray):** mantén pulsada la tecla **G**. Así se simula la sacudida del sensor de movimiento, aunque tu mando no tenga giroscopio. Puedes cambiar la tecla en la configuración de controles (acción `motion_shake`).
 
-Keyboard and mouse inputs can be customized in the settings menu by clicking the Controller button, and further details and help on controls are  also found there. Custom bindings are saved per-game. Inputs support up to three keys per binding, mouse buttons, mouse movement mapped to joystick input, and more.
+---
 
+## Ajustes
 
-# Firmware files
+Los ajustes del juego están en `%APPDATA%\shadPS4\custom_configs\CUSA00004.json`. También se pueden cambiar desde la interfaz, en la configuración específica del juego.
 
-shadPS4 can load some PlayStation 4 firmware files.
-The following firmware modules are supported and must be placed in shadPS4's `sys_modules` folder.
+| Ajuste | Sección | Valor recomendado | Para qué sirve |
+|---|---|---|---|
+| `fps_limit` | GPU | `30` | Límite de fps. `30` da un ritmo de imagen estable. `0` lo quita. `-1` es automático (30 en este juego). |
+| `readbacks_mode` | GPU | `2` | Lecturas precisas de la GPU. Hacen falta para efectos como el fuego y el humo. |
+| `copy_gpu_buffers` | GPU | `true` | Necesario para que algunos efectos se vean bien. |
+| `pipeline_cache_enabled` / `_archived` | Vulkan | `true` | Guarda los shaders compilados para no recompilarlos en cada partida. |
+| `redzone_patches` | General | `true` | Protección de memoria que este juego necesita en Windows. |
 
-<div align="center">
+**¿Por qué 30 fps por defecto?** En el PC de pruebas, sin límite, el juego va a unos 33-40 fps según la escena. Esa variación se nota más que un 30 fijo. Si tu PC es más potente, prueba con `"fps_limit": 0`.
 
-| Modules                        | Modules                        | Modules                        | Modules                        |
-|--------------------------------|--------------------------------|--------------------------------|--------------------------------|
-| libSceAt9Enc.sprx              | libSceAudiodec.sprx            | libSceAudiodecCpu.sprx         | libSceAudiodecCpuDdp.sprx      |
-| libSceAudiodecCpuDtsHdLbr.sprx | libSceAudiodecCpuHevag.sprx    | libSceAudiodecCpuM4aac.sprx    | libSceAvPlayer.sprx            |
-| libSceAvPlayerStreaming.sprx   | libSceBeisobmf.sprx            | libSceBemp2sys.sprx            | libSceCesCs.sprx               |
-| libSceFont.sprx                | libSceFontFt.sprx              | libSceFreeTypeOl.sprx          | libSceFreeTypeOptOl.sprx       |
-| libSceFreeTypeOt.sprx          | libSceJpegDec.sprx             | libSceJpegEnc.sprx             | libSceJson.sprx                |
-| libSceJson2.sprx               | libSceLibcInternal.sprx        | libSceNgs2.sprx                | libScePngEnc.sprx              |
-| libScePsmKitSystem.sprx        | libSceRtc.sprx                 | libSceRudp.sprx                | libSceSystemGesture.sprx       |
-| libSceUlt.sprx                 | libSceWkFontConfig.sprx        | libSceXml.sprx                 | libSceDepth.sprx               |
-| libScePadTracker.sprx          | libSceMoveTracker.sprx         |
-</div>
+Para pruebas puntuales, la variable de entorno `SHADPS4_FPS_CAP=N` tiene prioridad sobre el ajuste.
 
-> [!Caution]
-> The above modules are required to run the games properly and must be dumped from your legally owned PlayStation 4 console.
+---
 
+## Informes de fallo
 
+Si el juego o el emulador se cierra por un error, en la carpeta de logs se crean automáticamente estos archivos:
 
-# Main team
+```
+%APPDATA%\shadPS4\log\
+├── crash_AAAAMMDD_HHMMSS.txt      ← resumen: qué falló, dónde, registros y pila
+├── crash_AAAAMMDD_HHMMSS.dmp      ← volcado de memoria (minidump) para depurar
+└── crash_AAAAMMDD_HHMMSS_log.txt  ← copia del log en el momento del fallo
+```
 
-- [**georgemoralis**](https://github.com/georgemoralis)
-- [**psucien**](https://github.com/psucien)
-- [**viniciuslrangel**](https://github.com/viniciuslrangel)
-- [**roamic**](https://github.com/roamic)
-- [**squidbus**](https://github.com/squidbus)
-- [**frodo**](https://github.com/baggins183)
-- [**Stephen Miller**](https://github.com/StevenMiller123)
-- [**kalaposfos13**](https://github.com/kalaposfos13)
+**Envíanos los 3 archivos.** Agrega una descripción de qué hacías en el juego: misión, zona y qué acababa de pasar. Puedes mandarlos abriendo un *Issue* en este repositorio.
 
-Logo is done by [**Xphalnos**](https://github.com/Xphalnos)
+Notas:
+- Para abrir la carpeta, pega `%APPDATA%\shadPS4\log` en la barra del Explorador.
+- El log normal (`shad_log.txt`) se sobrescribe cada vez que abres el juego. La copia `crash_..._log.txt` no se pierde.
+- El `.dmp` no contiene tus partidas guardadas ni archivos personales. Sí contiene parte de la memoria del emulador en el momento del fallo.
+- Si el juego siguió funcionando con normalidad después de la hora del informe, puedes ignorarlo.
 
-<a href="https://github.com/shadps4-emu/shadPS4/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=shadps4-emu/shadPS4&max=24">
-</a>
+---
 
-# Contributing
+## Cambios respecto a shadPS4
 
-If you want to contribute, please read the [**CONTRIBUTING.md**](https://github.com/shadps4-emu/shadPS4/blob/main/CONTRIBUTING.md) file.\
-Open a PR and we'll check it :)
+Este fork parte de shadPS4 (rama `main`, commit `06e813f`). Todo el código experimental de pruebas se **eliminó**; aquí solo queda lo que se probó y funcionó.
 
+### Rendimiento y fluidez
+- **Compilación de shaders en segundo plano:** los pipelines de Vulkan se compilan en hilos de baja prioridad, sin congelar el juego. Antes, cada pipeline nuevo costaba entre 100 y 300 ms en el driver y las cinemáticas bajaban a 0-12 fps. Ahora el juego sigue y el efecto aparece cuando está listo. Los pipelines terminados se guardan en la caché de disco.
+- **Caché de shaders versionada** (`CUSA00004_v10`): una versión nueva del emulador no mezcla shaders de versiones viejas.
+- **Lecturas de la GPU asíncronas:** cuando el juego lee datos que escribió la GPU, se descarga una ventana de 512 KB en segundo plano. Además, se anticipan las zonas que el juego lee seguido.
+- **Menos trabajo repetido por dibujo:** se evitan llamadas repetidas para enlazar pipelines, buffers de vértices e índices, *push constants* (cerca del 80 % se ahorran) y descriptores.
+- **Cachés internas:** búsqueda de texturas, descriptores de textura, residencia de buffers y especializaciones de shaders.
+- **Hilos y CPU:**
+  - El hilo que procesa los comandos de la GPU tiene prioridad alta y se mantiene en los núcleos de rendimiento (P-cores) de CPUs híbridas.
+  - Windows ya no reduce el rendimiento del emulador cuando la ventana pierde el foco (EcoQoS desactivado).
+- **Menos fallos de página:** al escribir en memoria vigilada se desprotegen 64 KB de una vez, no página por página.
+- **Límite de fps configurable** (`fps_limit`), con 30 por defecto para este juego.
 
-# Special Thanks
+### Gráficos
+- **Fuego, humo y exposición:**
+  - Sincronización más amplia de la memoria compartida (LDS) en *compute shaders*.
+  - Sincronización de memoria global en shaders *wave64*.
+  - Estos dos cambios arreglan el parpadeo y los cuadros rotos en el fuego y el humo.
+- **Bucles en shaders wave64:** los bucles uniformes ya no se tratan como divergentes, así que los shaders se ejecutan correctamente.
+- **Partículas:** barrera compute→compute en el ordenamiento de partículas, para evitar que se lean datos a medio escribir.
+- **Stencil:** corrección del stencil frontal/trasero cuando el juego usa valores distintos para cada cara.
 
-A few noteworthy teams/projects who've helped us along the way are:
+### Estabilidad
+- **Copias de command buffers estables:** antes, al crecer el buffer de copia, se movía la memoria y quedaban punteros inválidos, lo que podía cerrar el juego. Ahora se usa una arena de bloques fijos.
+- **Si se llena la VRAM**, se reservan buffers e imágenes por encima del presupuesto en vez de cerrar el emulador.
+- **Informes de fallo automáticos:** texto, minidump y copia del log (ver arriba).
+- **Más información en el log** cuando hay un acceso inválido a memoria: dirección y registros.
 
-- [**Panda3DS**](https://github.com/wheremyfoodat/Panda3DS): A multiplatform 3DS emulator from our co-author wheremyfoodat. They have been incredibly helpful in understanding and solving problems that came up from natively executing the x64 code of PS4 binaries
+### Accesibilidad
+- **Agitar el mando con una tecla** (`motion_shake`, por defecto **G**), para las partes que piden sacudir el mando.
 
-- [**fpPS4**](https://github.com/red-prig/fpPS4): The fpPS4 team has assisted massively with understanding some of the more complex parts of the PS4 operating system and libraries, by helping with reverse engineering work and research.
+### Otros
+- La compilación automática de GitHub (CI) de este fork solo genera la versión de Windows.
 
-- **yuzu**: Our shader compiler has been designed with yuzu's Hades compiler as a blueprint. This allowed us to focus on the challenges of emulating a modern AMD GPU while having a high-quality optimizing shader compiler implementation as a base.
+El detalle técnico de cada cambio está en el historial de commits de esta rama.
 
-- [**felix86**](https://github.com/OFFTKP/felix86): A new x86-64 → RISC-V Linux userspace emulator
+---
 
-- [**emudev.org**](https://emudev.org/): A network of people interested in the documentation, emulation, simulation and re-implementation of hardware near extinction . Belongs to my friend skmp and me (shadow) also a member of it
+## Limitaciones conocidas
 
-# License
+- **Pulsación o parpadeo intermitente de la iluminación:** a veces la escena "palpita" con un parpadeo de luz. Ocurre de forma aleatoria, no en todas las partidas. Se sigue investigando.
+- **Rendimiento:** 60 fps todavía **no** se alcanzan. En el PC de pruebas, sin límite, las escenas pesadas con fuego van a unos 33-35 fps y otras zonas a 40-45. Por eso el límite por defecto es 30.
+- **Primera vez en cada zona:** algunos efectos u objetos pueden aparecer con un pequeño retraso mientras se compilan sus shaders. Las siguientes veces salen de la caché.
+- **Solo Windows.** No hay versiones para Linux ni macOS de este fork.
+- **Pruebas limitadas:** solo se probó en un PC (ver arriba) y sobre todo el inicio del juego. El resto de la historia, las misiones secundarias y el DLC *First Light* no se han probado.
+- **Las partidas guardadas** se guardan como en shadPS4 normal: `%APPDATA%\shadPS4\home\...\savedata\CUSA00004`. Haz copias de seguridad.
 
-- [**GPL-2.0 license**](https://github.com/shadps4-emu/shadPS4/blob/main/LICENSE)
+---
+
+## En qué estamos trabajando
+
+- Encontrar la causa de la **pulsación intermitente de la iluminación**.
+- **Más fps:**
+  - El juego pasa mucho tiempo esperando lecturas de la GPU, unos 0,5 s por cada segundo en la escena del fuego.
+  - El costo restante está repartido: vigilancia de páginas, enlace de buffers y búsquedas de texturas.
+  - La meta a largo plazo es 60 fps.
+- Probar más partes del juego, con la ayuda de los informes de fallo que nos envíen.
+
+---
+
+## Compilar desde el código
+
+Requisitos:
+- Visual Studio 2022 o posterior, con "Desarrollo para el escritorio con C++" y las herramientas de Clang (clang-cl).
+- CMake.
+- Ninja.
+- Git.
+
+```bat
+git clone --recursive -b infamous-second-son https://github.com/Nuigvarpu/shadPS4
+cd shadPS4
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
+cmake --build build --parallel
+```
+
+Ejecuta estos comandos desde la consola "x64 Native Tools Command Prompt for VS". El ejecutable queda en `build\shadPS4.exe`.
+
+---
+
+## Licencia y créditos
+
+- **shadPS4** es © shadPS4 Emulator Project y sus colaboradores. Se distribuye bajo la **GNU General Public License v2.0 o posterior** (`GPL-2.0-or-later`); ver [`LICENSE`](LICENSE). Algunos componentes de terceros tienen sus propias licencias, en la carpeta [`LICENSES`](LICENSES).
+- **Este fork** se distribuye bajo la misma licencia GPL-2.0-or-later. El código fuente completo de cada versión publicada está en esta rama (`infamous-second-son`).
+- **shadPS4 QtLauncher** es la interfaz oficial del proyecto shadPS4 ([shadps4-emu/shadps4-qtlauncher](https://github.com/shadps4-emu/shadps4-qtlauncher)), también bajo GPL-2.0-or-later. Se incluye sin modificaciones; su código fuente está en ese repositorio.
+- *inFAMOUS* y *inFAMOUS Second Son* son marcas de Sony Interactive Entertainment. "PlayStation" y "PS4" son marcas de Sony Interactive Entertainment Inc. Este proyecto no está afiliado ni respaldado por ellos.
+- La documentación original de shadPS4 está en [`README_shadPS4.md`](README_shadPS4.md).
+
+Agradecimientos al equipo y la comunidad de shadPS4 por el emulador sobre el que se construye todo esto.

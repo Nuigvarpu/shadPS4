@@ -437,7 +437,13 @@ struct SignalImpl : public PageManager::Impl {
         const auto is_gpu_thread =
             std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
         if (Common::IsWriteError(context)) {
-            return rasterizer->InvalidateMemory(addr, size, is_gpu_thread);
+            if (!rasterizer->InvalidateMemory(addr, size, is_gpu_thread)) {
+                return false;
+            }
+            // Unprotect the surrounding clean pages too, so a guest writing through memory
+            // sequentially does not fault on every page.
+            rasterizer->ExpandWriteFault(addr);
+            return true;
         } else {
             return rasterizer->ReadMemory(addr, size, is_gpu_thread);
         }

@@ -3,6 +3,7 @@
 
 #include <memory>
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -103,7 +104,7 @@ void UniqueImage::Destroy() {
 void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     this->image_ci = image_ci;
     ASSERT(!image);
-    const VmaAllocationCreateInfo alloc_ci = {
+    VmaAllocationCreateInfo alloc_ci = {
         .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         .requiredFlags = 0,
@@ -117,6 +118,18 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     VmaAllocationInfo alloc_info{};
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
                                      &allocation, &alloc_info);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        // Over the memory budget: allocate over it instead of crashing, the OS can page it.
+        static u32 warnings = 0;
+        if (warnings++ < 20) {
+            LOG_WARNING(Render_Vulkan,
+                        "Image {}x{} does not fit the GPU memory budget, allocating over it",
+                        image_ci.extent.width, image_ci.extent.height);
+        }
+        alloc_ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image, &allocation,
+                                &alloc_info);
+    }
     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
                vk::to_string(vk::Result{result}));
     image = vk::Image{unsafe_image};
@@ -229,6 +242,30 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
         subres_range &&
         (subres_range->base != SubresourceBase{} || subres_range->extent != info.resources);
     const bool partially_transited = !subresource_states.empty();
+
+    constexpr auto read_only_write_flags = vk::AccessFlagBits2::eTransferWrite |
+                                           vk::AccessFlagBits2::eShaderWrite |
+                                           vk::AccessFlagBits2::eMemoryWrite;
+    auto& last_partial = backing->last_partial;
+    if (needs_partial_transition && partially_transited && last_partial &&
+        !(dst_mask & read_only_write_flags) && last_partial->range == *subres_range &&
+        last_partial->layout == dst_layout && last_partial->access_mask == dst_mask) {
+        // The same range was moved to this read-only state by the previous transition and
+        // nothing changed since: walking every subresource again would emit no barrier.
+        last_state.layout = dst_layout;
+        last_state.access_mask = dst_mask;
+        last_state.pl_stage = dst_stage;
+        return;
+    }
+    if (needs_partial_transition) {
+        last_partial = BackingImage::PartialTransition{
+            .range = *subres_range,
+            .layout = dst_layout,
+            .access_mask = dst_mask,
+        };
+    } else {
+        last_partial.reset();
+    }
 
     if (needs_partial_transition || partially_transited) {
         if (!partially_transited) {

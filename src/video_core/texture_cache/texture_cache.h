@@ -359,6 +359,27 @@ private:
     BufferCache& buffer_cache;
     PageManager& tracker;
     PageTable page_table;
+
+    /// Exact matches found by FindImage, reused until any image is registered or unregistered.
+    struct FindImageKey {
+        VAddr guest_address;
+        u32 guest_size;
+        Extent3D size;
+        vk::Format pixel_format;
+        AmdGpu::ImageType type;
+        bool exact_fmt;
+
+        bool operator==(const FindImageKey&) const = default;
+
+        template <typename H>
+        friend H AbslHashValue(H h, const FindImageKey& key) {
+            return H::combine(std::move(h), key.guest_address, key.guest_size, key.size.width,
+                              key.size.height, key.size.depth, static_cast<u32>(key.pixel_format),
+                              static_cast<u32>(key.type), key.exact_fmt);
+        }
+    };
+    absl::flat_hash_map<FindImageKey, ImageId> find_image_cache;
+
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;
     Common::SlotVector<Sampler> slot_samplers;

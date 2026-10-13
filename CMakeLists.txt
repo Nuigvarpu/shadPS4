@@ -987,6 +987,8 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/module.cpp
          src/core/module.h
          src/core/platform.h
+         src/core/crash_report.cpp
+         src/core/crash_report.h
          src/core/signals.cpp
          src/core/signals.h
          src/core/thread.cpp
@@ -1397,7 +1399,7 @@ elseif (${CMAKE_SYSTEM_NAME} STREQUAL "FreeBSD")
 endif()
 
 if (WIN32)
-    target_link_libraries(shadps4 PRIVATE mincore wepoll wbemuuid)
+    target_link_libraries(shadps4 PRIVATE mincore wepoll wbemuuid dbghelp shell32)
 
     if (MSVC)
         # MSVC likes putting opinions on what people can use, disable:

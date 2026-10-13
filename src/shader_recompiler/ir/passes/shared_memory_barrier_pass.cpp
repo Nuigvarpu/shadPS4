@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <cstdlib>
-#include <string_view>
+#include <algorithm>
+#include <unordered_map>
 #include <unordered_set>
 #include "common/logging/log.h"
 #include "shader_recompiler/ir/breadth_first_search.h"
@@ -122,22 +122,12 @@ static NodeSet FindDivergentLoops(const IR::AbstractSyntaxList& syntax_list) {
 
 static constexpr u32 GcnSubgroupSize = 64;
 
-/// Debug switch: SHADPS4_LDS_SYNC=1 also synchronizes shared memory with workgroup barriers in
-/// workgroups larger than one GCN wave when the host subgroup is narrower than 64 lanes. GCN code
-/// may rely on the 64 lanes of a wave running in lockstep even in large workgroups (per-wave
-/// scratch areas, reduction tails), which does not hold when a wave is split across two host
-/// subgroups. Inside divergent control flow, where a workgroup barrier is not allowed, subgroup
-/// barriers keep at least the order within each host subgroup.
-static bool ExtendedLdsSync() {
-    static const bool enabled = [] {
-        const char* env = std::getenv("SHADPS4_LDS_SYNC");
-        const bool value = env != nullptr && std::string_view{env} == "1";
-        LOG_INFO(Render_Recompiler, "Extended shared memory synchronization: {}",
-                 value ? "enabled" : "disabled");
-        return value;
-    }();
-    return enabled;
-}
+// Shared memory is also synchronized with workgroup barriers in workgroups larger than one GCN
+// wave when the host subgroup is narrower than 64 lanes. This keeps inFAMOUS Second Son's exposure
+// from pulsing on NVIDIA. GCN code may rely on the 64 lanes of a wave running in lockstep even in
+// large workgroups (per-wave scratch areas, reduction tails), which does not hold when a wave is
+// split across two host subgroups. Inside divergent control flow, where a workgroup barrier is not
+// allowed, subgroup barriers keep at least the order within each host subgroup.
 
 void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_info,
                              const Profile& profile) {
@@ -153,8 +143,7 @@ void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_in
     }
     // The compiler can only omit barriers when the local workgroup size is the same as the HW
     // subgroup.
-    const bool extended =
-        profile.needs_lds_barriers && threadgroup_size > GcnSubgroupSize && ExtendedLdsSync();
+    const bool extended = profile.needs_lds_barriers && threadgroup_size > GcnSubgroupSize;
     if ((threadgroup_size != GcnSubgroupSize || !profile.needs_lds_barriers) && !extended) {
         // GCN waves can use shared memory between invocations without explicit barriers because
         // they run in lockstep. Host compilers can reorder these accesses, so keep their order
@@ -168,6 +157,7 @@ void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_in
     }
     using Type = IR::AbstractSyntaxNode::Type;
     u32 divergence_depth{};
+    u32 divergent_lds_blocks{};
     NodeSet divergence_end;
     const NodeSet divergent_loops = FindDivergentLoops(program.syntax_list);
     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
@@ -199,9 +189,193 @@ void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_in
             if (divergence_depth == 0) {
                 EmitBarrierInBlock(node.data.block);
             } else if (extended) {
+                const bool uses_lds =
+                    std::ranges::any_of(node.data.block->Instructions(), [](const IR::Inst& inst) {
+                        return IsLoadShared(inst) || IsWriteShared(inst);
+                    });
+                if (uses_lds) {
+                    ++divergent_lds_blocks;
+                }
                 EmitBarrierInBlock(node.data.block, true);
             }
         }
+    }
+    if (divergent_lds_blocks != 0) {
+        // Only subgroup barriers are allowed here, which do not order the two host subgroups
+        // that make up one GCN wave.
+        LOG_DEBUG(Render_Recompiler,
+                  "LDS sync: {} divergent blocks use shared memory in compute shader {:#x} "
+                  "(workgroup {}x{}x{})",
+                  divergent_lds_blocks, program.info.pgm_hash, cs_info.workgroup_size[0],
+                  cs_info.workgroup_size[1], cs_info.workgroup_size[2]);
+    }
+}
+
+static bool IsBufferLoad(const IR::Inst& inst) {
+    switch (inst.GetOpcode()) {
+    case IR::Opcode::LoadBufferU8:
+    case IR::Opcode::LoadBufferU16:
+    case IR::Opcode::LoadBufferU32:
+    case IR::Opcode::LoadBufferU32x2:
+    case IR::Opcode::LoadBufferU32x3:
+    case IR::Opcode::LoadBufferU32x4:
+    case IR::Opcode::LoadBufferU64:
+    case IR::Opcode::LoadBufferF32:
+    case IR::Opcode::LoadBufferF32x2:
+    case IR::Opcode::LoadBufferF32x3:
+    case IR::Opcode::LoadBufferF32x4:
+    case IR::Opcode::LoadBufferFormatF32:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool IsBufferStore(const IR::Inst& inst) {
+    switch (inst.GetOpcode()) {
+    case IR::Opcode::StoreBufferU8:
+    case IR::Opcode::StoreBufferU16:
+    case IR::Opcode::StoreBufferU32:
+    case IR::Opcode::StoreBufferU32x2:
+    case IR::Opcode::StoreBufferU32x3:
+    case IR::Opcode::StoreBufferU32x4:
+    case IR::Opcode::StoreBufferU64:
+    case IR::Opcode::StoreBufferF32:
+    case IR::Opcode::StoreBufferF32x2:
+    case IR::Opcode::StoreBufferF32x3:
+    case IR::Opcode::StoreBufferF32x4:
+    case IR::Opcode::StoreBufferFormatF32:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static std::optional<u32> BufferHandle(const IR::Inst& inst) {
+    const IR::Value handle = inst.Arg(0);
+    if (!handle.IsImmediate()) {
+        return std::nullopt;
+    }
+    return handle.U32();
+}
+
+static void EmitWaveSync(IR::Block* block, IR::Block::iterator where) {
+    IR::IREmitter ir{*block, where};
+    ir.WorkgroupMemoryBarrier();
+    ir.Barrier();
+    ir.WorkgroupMemoryBarrier();
+}
+
+// A compute workgroup of exactly one GCN wave runs in lockstep on hardware, so after a buffer
+// store (and s_waitcnt) every lane can read what the other 63 lanes wrote without a barrier.
+// GPU sorts (merge path and similar) rely on this. When the host subgroup is narrower than 64
+// lanes the workgroup is split across subgroups that do not run in lockstep, so a lane can read
+// the old contents before another subgroup has written them, duplicating and dropping elements.
+// Insert workgroup barriers between a buffer store and a later load of the same buffer.
+void WaveGlobalMemorySyncPass(IR::Program& program, const RuntimeInfo& runtime_info,
+                              const Profile& profile) {
+    if (program.info.hw_stage != HwStage::Compute || !profile.needs_lds_barriers) {
+        return;
+    }
+    const auto& cs_info = runtime_info.hw.cs;
+    const u32 threadgroup_size =
+        cs_info.workgroup_size[0] * cs_info.workgroup_size[1] * cs_info.workgroup_size[2];
+    if (threadgroup_size != GcnSubgroupSize) {
+        return;
+    }
+    using Type = IR::AbstractSyntaxNode::Type;
+
+    // Buffers loaded inside each loop, keyed by the loop merge block.
+    std::unordered_map<const IR::Block*, std::unordered_set<u32>> loop_loads;
+    {
+        std::vector<std::unordered_set<u32>> stack;
+        for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
+            if (node.type == Type::Loop) {
+                stack.emplace_back();
+            } else if (node.type == Type::Block) {
+                for (const IR::Inst& inst : node.data.block->Instructions()) {
+                    if (IsBufferLoad(inst)) {
+                        if (const auto handle = BufferHandle(inst)) {
+                            for (auto& set : stack) {
+                                set.insert(*handle);
+                            }
+                        }
+                    }
+                }
+            } else if (node.type == Type::Repeat && !stack.empty()) {
+                loop_loads[node.data.repeat.merge] = std::move(stack.back());
+                stack.pop_back();
+            }
+        }
+    }
+
+    // Buffers loaded by each block, in program order, and by every later block.
+    std::vector<IR::Block*> blocks;
+    for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
+        if (node.type == Type::Block) {
+            blocks.push_back(node.data.block);
+        }
+    }
+    std::unordered_map<const IR::Block*, std::unordered_set<u32>> loads_after;
+    {
+        std::unordered_set<u32> suffix;
+        for (auto it = blocks.rbegin(); it != blocks.rend(); ++it) {
+            loads_after[*it] = suffix;
+            for (const IR::Inst& inst : (*it)->Instructions()) {
+                if (IsBufferLoad(inst)) {
+                    if (const auto handle = BufferHandle(inst)) {
+                        suffix.insert(*handle);
+                    }
+                }
+            }
+        }
+    }
+
+    // Place the barrier right after the last store that a later read depends on. That point is
+    // reached by every invocation that stored, unlike the (often divergent) reads themselves.
+    std::vector<const std::unordered_set<u32>*> loops;
+    u32 barriers = 0;
+    for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
+        if (node.type == Type::Loop) {
+            const auto it = loop_loads.find(node.data.loop.merge);
+            loops.push_back(it != loop_loads.end() ? &it->second : nullptr);
+            continue;
+        }
+        if (node.type == Type::Repeat) {
+            if (!loops.empty()) {
+                loops.pop_back();
+            }
+            continue;
+        }
+        if (node.type != Type::Block) {
+            continue;
+        }
+        IR::Block* block = node.data.block;
+        const auto& later = loads_after[block];
+        const auto depends = [&](u32 handle) {
+            if (later.contains(handle)) {
+                return true;
+            }
+            return std::ranges::any_of(loops, [&](const std::unordered_set<u32>* set) {
+                return set != nullptr && set->contains(handle);
+            });
+        };
+        auto last_store = block->end();
+        for (auto it = block->begin(); it != block->end(); ++it) {
+            if (IsBufferStore(*it)) {
+                if (const auto handle = BufferHandle(*it); handle && depends(*handle)) {
+                    last_store = it;
+                }
+            }
+        }
+        if (last_store != block->end()) {
+            EmitWaveSync(block, std::next(last_store));
+            ++barriers;
+        }
+    }
+    if (barriers != 0) {
+        LOG_DEBUG(Render_Recompiler, "Wave sync: {} barriers in compute shader {:#x}", barriers,
+                  program.info.pgm_hash);
     }
 }
 

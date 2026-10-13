@@ -432,6 +432,9 @@ struct GPUSettings {
     Setting<int> rcas_attenuation{250};
     Setting<bool> userfaultfd{false};
     Setting<bool> inline_fetch_shader{false};
+    // Maximum game frames shown per second. -1: automatic (30 for games known to need a steady
+    // cap, otherwise off), 0: off, N: at most N frames per second.
+    Setting<s32> fps_limit{-1};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -456,6 +459,7 @@ struct GPUSettings {
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
             make_override<GPUSettings>("userfaultfd", &GPUSettings::userfaultfd),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
+            make_override<GPUSettings>("fps_limit", &GPUSettings::fps_limit),
         };
     }
 };
@@ -465,7 +469,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    direct_memory_access_enabled, dump_shaders, patch_shaders,
                                    vblank_frequency, full_screen, full_screen_mode, present_mode,
                                    hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
-                                   userfaultfd, inline_fetch_shader)
+                                   userfaultfd, inline_fetch_shader, fps_limit)
 
 // -------------------------------
 // Vulkan settings
@@ -744,6 +748,7 @@ public:
     SETTING_FORWARD_BOOL_READONLY(m_gpu, PatchShaders, patch_shaders)
     SETTING_FORWARD_BOOL(m_gpu, UserfaultfdTracking, userfaultfd)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
+    SETTING_FORWARD(m_gpu, FpsLimit, fps_limit)
 
     u32 GetVblankFrequency() {
         if (m_gpu.vblank_frequency.value < 30) {

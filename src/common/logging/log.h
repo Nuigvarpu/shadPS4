@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <filesystem>
 #include <fmt/base.h>
 
 #include "common/logging/classes.h"
@@ -26,6 +27,8 @@ void Setup(std::string_view shadps4_filename);
 void Switch(std::string_view game_filename, bool append_log);
 void Shutdown();
 void Flush();
+/// Path of the file the log is currently written to, or empty if logging to a file is not set up.
+std::filesystem::path CurrentLogFile();
 void Terminate();
 void UpdateSinks();
 void UpdateLogLevels(std::string_view log_filter);
