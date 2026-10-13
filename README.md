@@ -3,7 +3,7 @@
 Versión modificada del emulador de PS4 **[shadPS4](https://github.com/shadps4-emu/shadPS4)**, ajustada para jugar **inFAMOUS Second Son** (CUSA00004, actualización 1.07) en PC con Windows.
 
 > [!IMPORTANT]
-> - **El juego NO viene incluido.** Este proyecto no contiene el juego ni la actualización, y no da enlaces para conseguirlos. Necesitas tu propia copia legal: un volcado de tu disco o de tu consola, más la actualización 1.07 de tu cuenta.
+> - **El juego NO viene incluido.** Este proyecto no contiene el juego ni la actualización, y no da enlaces para conseguirlos. Necesitas tu propia copia, volcado de tu disco o de tu consola, más la actualización 1.07.
 > - **Es un proyecto no oficial.** No está afiliado al equipo de shadPS4, a Sony Interactive Entertainment ni a Sucker Punch Productions. Las marcas pertenecen a sus dueños.
 > - **El juego NO ha sido probado al 100 %.** Se probó sobre todo el inicio del juego y las primeras zonas, incluida la escena del fuego. Puede haber fallos más adelante que todavía no conocemos (ver [Informes de fallo](#informes-de-fallo)).
 
