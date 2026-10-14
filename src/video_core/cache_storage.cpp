@@ -29,7 +29,16 @@ std::queue<std::packaged_task<void()>> req_queue{};
 std::mutex m_request{};
 
 mz_zip_archive zip_ar{};
+mz_zip_archive zip_out{};
 bool ar_is_read_only{true};
+bool carried_over{false};
+
+/// New blobs go to a copy of the archive that only replaces the original once it is complete, so
+/// a crash or a killed process cannot corrupt the cache.
+std::filesystem::path PendingArchivePath(std::filesystem::path path) {
+    path += ".tmp";
+    return path;
+}
 
 } // namespace
 
@@ -102,13 +111,13 @@ void DataBase::Open() {
         cache_path = GetUserPath(PathType::CacheDir) /
                      fmt::format("{}_v{}.zip", game_info.GameSerial(), CacheFormatVersion);
 
-        if (!mz_zip_reader_init_file(&zip_ar, cache_path.string().c_str(),
-                                     MZ_ZIP_FLAG_READ_ALLOW_WRITING) ||
+        mz_zip_zero_struct(&zip_out);
+        if (!mz_zip_reader_init_file(&zip_ar, cache_path.string().c_str(), 0) ||
             !mz_zip_validate_archive(&zip_ar, 0)) {
             LOG_INFO(Render, "Cache archive {} is not found or archive is corrupted",
                      cache_path.string().c_str());
             mz_zip_reader_end(&zip_ar);
-            mz_zip_writer_init_file(&zip_ar, cache_path.string().c_str(), 0);
+            mz_zip_zero_struct(&zip_ar);
         }
     } else {
         cache_path = GetUserPath(PathType::CacheDir) /
@@ -129,10 +138,33 @@ void DataBase::Close() {
 
     io_worker.request_stop();
     io_worker.join();
+    {
+        std::scoped_lock lock{m_request};
+        while (!req_queue.empty()) {
+            auto request = std::move(req_queue.front());
+            req_queue.pop();
+            request();
+        }
+        num_requests = 0;
+    }
 
     if (EmulatorSettings.IsPipelineCacheArchived()) {
-        mz_zip_writer_finalize_archive(&zip_ar);
-        mz_zip_writer_end(&zip_ar);
+        const bool written =
+            !ar_is_read_only && carried_over && mz_zip_writer_finalize_archive(&zip_out);
+        mz_zip_writer_end(&zip_out);
+        mz_zip_reader_end(&zip_ar);
+        mz_zip_zero_struct(&zip_out);
+        mz_zip_zero_struct(&zip_ar);
+        if (written) {
+            std::error_code ec;
+            std::filesystem::rename(PendingArchivePath(cache_path), cache_path, ec);
+            if (ec) {
+                LOG_ERROR(Render, "Failed to replace cache archive {}: {}", cache_path.string(),
+                          ec.message());
+            }
+        }
+        ar_is_read_only = true;
+        carried_over = false;
     }
 
     opened = false;
@@ -148,7 +180,7 @@ bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector
             if (EmulatorSettings.IsPipelineCacheArchived()) {
                 ASSERT_MSG(!ar_is_read_only,
                            "The archive is read-only. Did you forget to call `FinishPreload`?");
-                if (!mz_zip_writer_add_mem(&zip_ar, path.string().c_str(), v.data(),
+                if (!mz_zip_writer_add_mem(&zip_out, path.string().c_str(), v.data(),
                                            v.size() * sizeof(T), MZ_BEST_COMPRESSION)) {
                     LOG_ERROR(Render, "Failed to add {} to the archive", path.string().c_str());
                 }
@@ -262,10 +294,35 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
 }
 
 void DataBase::FinishPreload() {
-    if (EmulatorSettings.IsPipelineCacheArchived()) {
-        mz_zip_writer_init_from_reader(&zip_ar, cache_path.string().c_str());
-        ar_is_read_only = false;
+    if (!EmulatorSettings.IsPipelineCacheArchived() || !ar_is_read_only) {
+        return;
     }
+    const auto pending_path = PendingArchivePath(cache_path);
+    if (!mz_zip_writer_init_file(&zip_out, pending_path.string().c_str(), 0)) {
+        LOG_ERROR(Render, "Failed to create cache archive {}", pending_path.string());
+        Close();
+        return;
+    }
+    ar_is_read_only = false;
+
+    auto request = std::packaged_task<void()>{[] {
+        const auto num_files = mz_zip_reader_get_num_files(&zip_ar);
+        for (mz_uint index = 0; index < num_files; ++index) {
+            if (!mz_zip_writer_add_from_zip_reader(&zip_out, &zip_ar, index)) {
+                LOG_ERROR(Render, "Failed to copy cache entry {}, keeping the previous archive",
+                          index);
+                return;
+            }
+        }
+        carried_over = true;
+    }};
+    {
+        std::scoped_lock lock{m_request};
+        req_queue.emplace(std::move(request));
+    }
+    std::scoped_lock lk{submit_mutex};
+    ++num_requests;
+    request_cv.notify_one();
 }
 
 } // namespace Storage

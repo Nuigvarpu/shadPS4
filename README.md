@@ -152,6 +152,7 @@ Este fork parte de shadPS4 (rama `main`, commit `06e813f`). Todo el código expe
 ### Rendimiento y fluidez
 - **Compilación de shaders en segundo plano:** los pipelines de Vulkan se compilan en hilos de baja prioridad, sin congelar el juego. Antes, cada pipeline nuevo costaba entre 100 y 300 ms en el driver y las cinemáticas bajaban a 0-12 fps. Ahora el juego sigue y el efecto aparece cuando está listo. Los pipelines terminados se guardan en la caché de disco.
 - **Caché de shaders versionada** (`CUSA00004_v10`): una versión nueva del emulador no mezcla shaders de versiones viejas.
+- **Caché de shaders a prueba de cierres:** los shaders nuevos se guardan en una copia (`CUSA00004_v10.zip.tmp`) que reemplaza a la caché solo al cerrar el juego bien. Si el juego se cuelga o se cierra a la fuerza, se pierden solo los shaders de esa sesión, no toda la caché.
 - **Lecturas de la GPU asíncronas:** cuando el juego lee datos que escribió la GPU, se descarga una ventana de 512 KB en segundo plano. Además, se anticipan las zonas que el juego lee seguido.
 - **Menos trabajo repetido por dibujo:** se evitan llamadas repetidas para enlazar pipelines, buffers de vértices e índices, *push constants* (cerca del 80 % se ahorran) y descriptores.
 - **Cachés internas:** búsqueda de texturas, descriptores de textura, residencia de buffers y especializaciones de shaders.
